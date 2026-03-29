@@ -52,9 +52,9 @@ class ImageCache:
     def _is_expired(self, entry, ttl):
         return time.time() - entry['time'] > ttl
     
-    def get_directory_listing(self, input_dir):
+    def get_directory_listing(self, input_dir, recursive=False):
         """Get cached directory listing or refresh if expired."""
-        cache_key = f"dir:{input_dir}"
+        cache_key = f"dir:{input_dir}:{recursive}"
         
         with self._lock:
             if cache_key in self._cache:
@@ -63,7 +63,7 @@ class ImageCache:
                     return entry['data']
         
         # Refresh cache
-        images, folders, mtimes = self._scan_directory(input_dir)
+        images, folders, mtimes = self._scan_directory(input_dir, recursive)
         
         with self._lock:
             self._cache[cache_key] = {
@@ -73,7 +73,7 @@ class ImageCache:
         
         return images, folders, mtimes
     
-    def _scan_directory(self, input_dir):
+    def _scan_directory(self, input_dir, recursive=False):
         """Scan directory and return images, folders, and modification times."""
         images = []
         folders = set()
@@ -82,20 +82,29 @@ class ImageCache:
         if not os.path.exists(input_dir):
             return images, [], mtimes
         
-        # Only scan the top-level directory, not subdirectories
         try:
-            for entry in os.scandir(input_dir):
-                if entry.is_dir():
-                    # Add subfolder to the list (for folder navigation if needed)
-                    folders.add(entry.name)
-                elif entry.is_file():
-                    ext = os.path.splitext(entry.name)[1].lower()
+            walk_generator = os.walk(input_dir)
+            
+            for root, dirs, files in walk_generator:
+                if root == input_dir:
+                    for d in dirs:
+                        if not d.startswith('.'):
+                            folders.add(d)
+
+                for entry_name in files:
+                    ext = os.path.splitext(entry_name)[1].lower()
                     if ext in IMAGE_EXTENSIONS:
-                        images.append(entry.name)
+                        full_path = os.path.join(root, entry_name)
+                        rel_path = os.path.relpath(full_path, input_dir)
+                        images.append(rel_path.replace('\\', '/'))
                         try:
-                            mtimes[entry.name] = entry.stat().st_mtime
+                            mtimes[rel_path] = os.path.getmtime(full_path)
                         except OSError:
-                            mtimes[entry.name] = 0
+                            mtimes[rel_path] = 0
+                
+                if not recursive:
+                    break
+                    
         except OSError as e:
             print(f"Error scanning directory {input_dir}: {e}")
             return images, [], mtimes
@@ -128,7 +137,6 @@ class ImageCache:
         """Clear all caches."""
         with self._lock:
             self._cache.clear()
-            # Keep metadata cache as it's based on mtime
 
 _image_cache = ImageCache()
 
@@ -172,22 +180,18 @@ def has_comfyui_metadata_fast(image_path, mtime=None):
         except OSError:
             mtime = 0
     
-    # Check cache first
     cached = _image_cache.get_metadata_status(image_path, mtime)
     if cached is not None:
         return cached
     
-    # Read metadata from file
     try:
         with open(image_path, 'rb') as f:
-            # Read PNG signature + IHDR
             header = f.read(33)
             if len(header) < 8 or header[:8] != b'\x89PNG\r\n\x1a\n':
                 _image_cache.set_metadata_status(image_path, mtime, False)
                 return False
             
-            # Scan for tEXt chunks containing 'prompt' or 'workflow'
-            f.seek(8)  # Skip signature
+            f.seek(8)
             has_meta = False
             
             while True:
@@ -199,16 +203,15 @@ def has_comfyui_metadata_fast(image_path, mtime=None):
                 chunk_type = chunk_header[4:8]
                 
                 if chunk_type in (b'tEXt', b'iTXt'):
-                    # Read chunk data to check for keywords
-                    chunk_data = f.read(min(length, 1024))  # Read up to 1KB
+                    chunk_data = f.read(min(length, 1024))
                     if b'prompt' in chunk_data or b'workflow' in chunk_data:
                         has_meta = True
                         break
-                    f.seek(length - len(chunk_data) + 4, 1)  # Skip rest + CRC
+                    f.seek(length - len(chunk_data) + 4, 1)
                 elif chunk_type == b'IEND':
                     break
                 else:
-                    f.seek(length + 4, 1)  # Skip chunk data + CRC
+                    f.seek(length + 4, 1)
             
             _image_cache.set_metadata_status(image_path, mtime, has_meta)
             return has_meta
@@ -218,7 +221,7 @@ def has_comfyui_metadata_fast(image_path, mtime=None):
         return False
 
 
-def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="name", source_folder=""):
+def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="name", source_folder="", recursive=False):
     """Optimized image listing with caching and multiple source folder support."""
     
     # Handle "ALL" source folder - scan all configured folders
@@ -233,7 +236,7 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
             if not folder_path or not os.path.exists(folder_path):
                 continue
             
-            images, folders_list, mtimes = _image_cache.get_directory_listing(folder_path)
+            images, folders_list, mtimes = _image_cache.get_directory_listing(folder_path, recursive=False)
             
             # Prefix images with folder name for uniqueness
             folder_name = folder_config.get('name', os.path.basename(folder_path))
@@ -272,64 +275,75 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
         
         return all_images, sorted(list(all_folders)), all_mtimes, "__ALL__"
     
-    # Original single folder logic
+    # --- 单个文件夹模式 ---
+    root_source_dir = folder_paths.get_input_directory()
     if source_folder:
         folders = load_source_folders()
         source_folder_norm = os.path.normpath(source_folder)
         valid_source = any(os.path.normpath(f.get('path', '')) == source_folder_norm for f in folders)
         
         if valid_source and os.path.exists(source_folder) and os.path.isdir(source_folder):
-            input_dir = source_folder
+            root_source_dir = source_folder
+
+    # 确定最终扫描的根目录
+    scan_root = root_source_dir
+    if subfolder:
+        potential_path = os.path.normpath(os.path.join(root_source_dir, subfolder))
+        # 安全检查：防止目录遍历
+        if os.path.commonpath([root_source_dir, potential_path]) == os.path.commonpath([root_source_dir]):
+             if os.path.exists(potential_path) and os.path.isdir(potential_path):
+                 scan_root = potential_path
+             else:
+                 return [], [], {}, root_source_dir
+
+    # 扫描目录（传入recursive参数）
+    actual_recursive = recursive if not subfolder else False
+    all_images_rel, all_folders, mtimes = _image_cache.get_directory_listing(scan_root, actual_recursive)
+
+    # 把相对路径统一转为相对于根source_folder的完整路径
+    all_images = []
+    for img_rel_path in all_images_rel:
+        if subfolder:
+            full_rel_path = os.path.join(subfolder, img_rel_path).replace('\\', '/')
         else:
-            input_dir = folder_paths.get_input_directory()
-    else:
-        input_dir = folder_paths.get_input_directory()
+            full_rel_path = img_rel_path.replace('\\', '/')
+        
+        full_abs_path = os.path.join(scan_root, img_rel_path)
+        
+        all_images.append({
+            'name': os.path.basename(full_rel_path),
+            'original_name': full_rel_path,
+            'source_folder': root_source_dir,
+            'actual_source': os.path.dirname(full_abs_path),
+            'mtime': mtimes.get(img_rel_path, 0)
+        })
     
-    # Get cached directory listing
-    all_images, all_folders, mtimes = _image_cache.get_directory_listing(input_dir)
-    
-    # Filter by subfolder - REMOVED since we're removing subfolder filtering
-    # if subfolder:
-    #     ...
-    
-    # Apply metadata filter (only if needed)
+    # Apply metadata filter
     if metadata_filter != "all":
         filtered_images = []
-        for img in all_images:
-            full_path = os.path.join(input_dir, img)
-            mtime = mtimes.get(img, 0)
+        for img_data in all_images:
+            full_path = os.path.join(img_data['source_folder'], img_data['original_name'])
+            mtime = img_data['mtime']
             has_meta = has_comfyui_metadata_fast(full_path, mtime)
             
             if metadata_filter == "with" and has_meta:
-                filtered_images.append(img)
+                filtered_images.append(img_data)
             elif metadata_filter == "without" and not has_meta:
-                filtered_images.append(img)
-        
+                filtered_images.append(img_data)
         all_images = filtered_images
     
     # Apply sorting
     if sort_by == "date":
-        all_images = sorted(all_images, key=lambda x: mtimes.get(x, 0), reverse=True)
+        all_images = sorted(all_images, key=lambda x: x['mtime'], reverse=True)
     elif sort_by == "date_asc":
-        all_images = sorted(all_images, key=lambda x: mtimes.get(x, 0))
+        all_images = sorted(all_images, key=lambda x: x['mtime'])
     else:
-        all_images = sorted(all_images, key=lambda x: x.lower())
+        all_images = sorted(all_images, key=lambda x: x['name'].lower())
     
-    # Convert to consistent format
-    image_list = []
-    for img in all_images:
-        image_list.append({
-            'name': img,
-            'original_name': img,
-            'source_folder': input_dir,
-            'mtime': mtimes.get(img, 0)
-        })
-    
-    return image_list, all_folders, mtimes, input_dir
+    return all_images, all_folders, mtimes, root_source_dir
 
 def get_thumbnail_path(image_path):
     """Get path to cached thumbnail."""
-    # Create hash of path + mtime for cache key
     try:
         mtime = os.path.getmtime(image_path)
     except OSError:
@@ -339,7 +353,7 @@ def get_thumbnail_path(image_path):
     return os.path.join(CACHE_DIR, f"{cache_key}.webp")
 
 
-def generate_thumbnail(image_path, max_size=400):  # Doubled from 200
+def generate_thumbnail(image_path, max_size=400):
     """Generate and cache a thumbnail."""
     thumb_path = get_thumbnail_path(image_path)
     
@@ -360,7 +374,6 @@ def generate_thumbnail(image_path, max_size=400):  # Doubled from 200
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
             
-            # Quality 92, method 4 for good speed/quality balance
             img.save(thumb_path, 'WEBP', quality=92, method=4)
             return thumb_path
     except Exception as e:
@@ -380,7 +393,6 @@ def load_source_folders():
             data = json.load(f)
             folders = data.get('folders', [])
             
-            # Normalize paths and filter out non-existent folders
             valid_folders = []
             for f in folders:
                 path = os.path.normpath(f.get('path', ''))
@@ -391,13 +403,11 @@ def load_source_folders():
                         "is_default": f.get('is_default', False)
                     })
             
-            # Always ensure input folder is first
             input_dir_norm = os.path.normpath(input_dir)
             has_input = any(os.path.normpath(f.get('path', '')) == input_dir_norm for f in valid_folders)
             if not has_input:
                 valid_folders.insert(0, default_folder)
             else:
-                # Move input to first position if it exists
                 for i, f in enumerate(valid_folders):
                     if os.path.normpath(f.get('path', '')) == input_dir_norm:
                         f['is_default'] = True
@@ -429,9 +439,6 @@ async def browse_folder(request):
     import sys
     
     def open_folder_dialog():
-        """Open folder dialog in a separate thread to avoid blocking."""
-        
-        # Windows: Use PowerShell with OpenFileDialog configured for folders
         if sys.platform == 'win32':
             try:
                 powershell_script = '''
@@ -445,7 +452,6 @@ async def browse_folder(request):
                 $dialog.FileName = "Folder Selection"
                 $dialog.Filter = "Folders|*.folder"
                 
-                # Create a form to be the parent and bring to front
                 $form = New-Object System.Windows.Forms.Form
                 $form.TopMost = $true
                 $form.MinimizeBox = $false
@@ -466,17 +472,16 @@ async def browse_folder(request):
                 }
                 '''
                 
-                # Run PowerShell with hidden window
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0  # SW_HIDE
+                startupinfo.wShowWindow = 0
                 
                 result = subprocess.run(
                     ['powershell', '-ExecutionPolicy', 'Bypass', '-NoProfile', '-Command', powershell_script],
                     capture_output=True,
                     text=True,
                     startupinfo=startupinfo,
-                    timeout=120  # 2 minute timeout
+                    timeout=120
                 )
                 
                 folder_path = result.stdout.strip()
@@ -493,21 +498,16 @@ async def browse_folder(request):
                 return {"error": "Folder dialog timed out. Please try again."}
             except Exception as e:
                 print(f"PowerShell folder dialog failed: {e}")
-                # Fall through to tkinter
         
-        # Try tkinter (cross-platform fallback)
         try:
             import tkinter as tk
             from tkinter import filedialog
             
             root = tk.Tk()
             root.withdraw()
-            
-            # Make sure dialog appears on top
             root.wm_attributes('-topmost', 1)
             root.focus_force()
             
-            # On Windows, also try to lift the window
             if sys.platform == 'win32':
                 root.lift()
                 root.attributes('-topmost', True)
@@ -531,10 +531,8 @@ async def browse_folder(request):
         except Exception as tk_error:
             print(f"Tkinter folder dialog failed: {tk_error}")
         
-        # Linux/Mac: Try zenity or kdialog
         if sys.platform != 'win32':
             try:
-                # Try zenity first (common on GNOME)
                 result = subprocess.run(
                     ['zenity', '--file-selection', '--directory', '--title=Select Source Folder'],
                     capture_output=True,
@@ -552,7 +550,6 @@ async def browse_folder(request):
                 pass
             
             try:
-                # Try kdialog (common on KDE)
                 result = subprocess.run(
                     ['kdialog', '--getexistingdirectory', '--title', 'Select Source Folder'],
                     capture_output=True,
@@ -595,23 +592,17 @@ async def paste_image(request):
             return web.json_response({"error": "No image data provided"}, status=400)
         
         image_field = data['image']
-        
-        # Read image data
         image_data = image_field.file.read()
         
-        # Generate filename with timestamp
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"pasted_image_{timestamp}.png"
         
-        # Get input directory
         input_dir = folder_paths.get_input_directory()
         filepath = os.path.join(input_dir, filename)
         
-        # Save the image
         with open(filepath, 'wb') as f:
             f.write(image_data)
         
-        # Invalidate cache
         _image_cache.invalidate()
         
         return web.json_response({
@@ -646,30 +637,25 @@ async def add_source_folder(request):
         if not folder_path:
             return web.json_response({"error": "Path is required"}, status=400)
         
-        # Normalize path
         folder_path = os.path.normpath(folder_path)
         
-        # Validate path exists and is a directory
         if not os.path.exists(folder_path):
             return web.json_response({"error": f"Path does not exist: {folder_path}"}, status=400)
         
         if not os.path.isdir(folder_path):
             return web.json_response({"error": f"Path is not a directory: {folder_path}"}, status=400)
         
-        # Generate name if not provided
         if not folder_name:
             folder_name = os.path.basename(folder_path) or folder_path
         
         folders = load_source_folders()
         
-        # Check if already exists
         if any(os.path.normpath(f.get('path', '')) == folder_path for f in folders):
             return web.json_response({"error": "Folder already exists in the list"}, status=400)
         
         folders.append({"path": folder_path, "name": folder_name, "is_default": False})
         save_source_folders(folders)
         
-        # Invalidate cache
         _image_cache.invalidate()
         
         return web.json_response({"status": "ok", "folders": folders})
@@ -689,7 +675,6 @@ async def delete_image(request):
         if not image_name:
             return web.json_response({"error": "Image name is required"}, status=400)
         
-        # Determine base directory
         if source_folder:
             folders = load_source_folders()
             source_norm = os.path.normpath(source_folder)
@@ -702,10 +687,8 @@ async def delete_image(request):
         else:
             input_dir = folder_paths.get_input_directory()
         
-        # Build and validate path
         image_path = os.path.normpath(os.path.join(input_dir, image_name))
         
-        # Security check - ensure path is within allowed directory
         if not image_path.startswith(os.path.normpath(input_dir)):
             return web.json_response({"error": "Invalid image path"}, status=403)
         
@@ -715,15 +698,13 @@ async def delete_image(request):
         if not os.path.isfile(image_path):
             return web.json_response({"error": "Path is not a file"}, status=400)
         
-        # Delete thumbnail cache first (before moving original)
         thumb_path = get_thumbnail_path(image_path)
         if os.path.exists(thumb_path):
             try:
-                os.remove(thumb_path)  # Thumbnail can be permanently deleted
+                os.remove(thumb_path)
             except:
                 pass
         
-        # Move to recycle bin or delete permanently
         if HAS_SEND2TRASH:
             send2trash(image_path)
             method = "recycled"
@@ -731,7 +712,6 @@ async def delete_image(request):
             os.remove(image_path)
             method = "deleted"
         
-        # Invalidate cache
         _image_cache.invalidate()
         
         return web.json_response({"status": "ok", "message": f"Image {method}: {image_name}", "method": method})
@@ -754,20 +734,16 @@ async def remove_source_folder(request):
         folder_path = os.path.normpath(folder_path)
         folders = load_source_folders()
         
-        # Don't allow removing default input folder
         input_dir = os.path.normpath(folder_paths.get_input_directory())
         if folder_path == input_dir:
             return web.json_response({"error": "Cannot remove the default input folder"}, status=400)
         
-        # Filter out the folder to remove
         new_folders = [f for f in folders if os.path.normpath(f.get('path', '')) != folder_path]
         
         if len(new_folders) == len(folders):
             return web.json_response({"error": "Folder not found in the list"}, status=400)
         
         save_source_folders(new_folders)
-        
-        # Invalidate cache
         _image_cache.invalidate()
         
         return web.json_response({"status": "ok", "folders": new_folders})
@@ -786,6 +762,9 @@ async def get_images_endpoint(request):
         sort_by = request.query.get('sort', 'name')
         source_folder = request.query.get('source', '')
         
+        recursive = request.query.get('recursive', 'false').lower() == 'true'
+        subfolder = request.query.get('subfolder', '')
+        
         if metadata_filter not in ['all', 'with', 'without']:
             metadata_filter = 'all'
         
@@ -796,7 +775,7 @@ async def get_images_endpoint(request):
             source_folder = urllib.parse.unquote(source_folder)
         
         all_images, all_folders, mtimes, used_input_dir = get_input_images_optimized(
-            "", metadata_filter, sort_by, source_folder
+            subfolder, metadata_filter, sort_by, source_folder, recursive
         )
         
         if search:
@@ -815,20 +794,19 @@ async def get_images_endpoint(request):
             encoded_source = urllib.parse.quote(img_data['source_folder'], safe='')
             mtime = img_data.get('mtime', 0)
             
-            # Get image dimensions
             width, height = 0, 0
             try:
                 full_path = os.path.join(img_data['source_folder'], img_data['original_name'])
                 with Image.open(full_path) as img:
                     width, height = img.size
             except Exception as e:
-                pass  # Keep as 0, 0 if unable to read
+                pass
             
             image_info_list.append({
                 "name": img_data['name'],
                 "original_name": img_data['original_name'],
                 "preview_url": f"/imagegallery/thumb?filename={encoded_name}&source={encoded_source}&t={int(mtime)}",
-                "source": img_data['source_folder'],
+                "source": img_data.get('actual_source', img_data['source_folder']),
                 "width": width,
                 "height": height
             })
@@ -844,6 +822,39 @@ async def get_images_endpoint(request):
         import traceback
         print(f"Error in get_images_endpoint: {traceback.format_exc()}")
         return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.get("/imagegallery/get_subfolders")
+async def get_subfolders(request):
+    try:
+        source = request.query.get('source', '')
+        if not source or source == '__ALL__':
+            return web.json_response({"subfolders": []})
+
+        source = urllib.parse.unquote(source)
+        
+        folders = load_source_folders()
+        source_norm = os.path.normpath(source)
+        valid_source = any(os.path.normpath(f.get('path', '')) == source_norm for f in folders)
+        
+        if not valid_source:
+            input_dir = os.path.normpath(folder_paths.get_input_directory())
+            if source_norm != input_dir:
+                return web.json_response({"subfolders": []}, status=403)
+
+        subfolders = []
+        if os.path.exists(source):
+            try:
+                with os.scandir(source) as it:
+                    for entry in it:
+                        if entry.is_dir() and not entry.name.startswith('.'):
+                            subfolders.append(entry.name)
+            except OSError:
+                pass
+                
+        return web.json_response({"subfolders": sorted(subfolders, key=lambda x: x.lower())})
+    except Exception as e:
+        print(f"Error in get_subfolders: {e}")
+        return web.json_response({"subfolders": []})
 
 @server.PromptServer.instance.routes.get("/imagegallery/thumb")
 async def get_thumbnail(request):
@@ -861,9 +872,7 @@ async def get_thumbnail(request):
         if ".." in filename_decoded:
             return web.Response(status=403, text="Invalid filename")
         
-        # Determine base directory
         if source_decoded:
-            # Validate source is in our configured list
             folders = load_source_folders()
             source_norm = os.path.normpath(source_decoded)
             valid_source = any(os.path.normpath(f.get('path', '')) == source_norm for f in folders)
@@ -877,14 +886,12 @@ async def get_thumbnail(request):
         
         image_path = os.path.normpath(os.path.join(input_dir, filename_decoded))
         
-        # Security check
         if not image_path.startswith(os.path.normpath(input_dir)):
             return web.Response(status=403, text="Access denied")
         
         if not os.path.exists(image_path):
             return web.Response(status=404, text="Image not found")
         
-        # Generate or get cached thumbnail
         thumb_path = generate_thumbnail(image_path)
         
         if thumb_path and os.path.exists(thumb_path):
@@ -914,7 +921,6 @@ async def get_preview_image(request):
         if ".." in filename_decoded:
             return web.Response(status=403, text="Invalid filename")
         
-        # Determine base directory
         if source_decoded:
             folders = load_source_folders()
             source_norm = os.path.normpath(source_decoded)
@@ -941,15 +947,12 @@ async def get_preview_image(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-
-
 def cleanup_orphaned_thumbnails():
     """Remove thumbnails for images that no longer exist."""
     try:
         if not os.path.exists(CACHE_DIR):
             return
         
-        # Get all cached thumbnail files
         cached_files = set()
         for filename in os.listdir(CACHE_DIR):
             if filename.endswith('.webp'):
@@ -958,7 +961,6 @@ def cleanup_orphaned_thumbnails():
         if not cached_files:
             return
         
-        # Get all valid source folders
         folders = load_source_folders()
         valid_dirs = [folder_paths.get_input_directory()]
         for folder in folders:
@@ -966,7 +968,6 @@ def cleanup_orphaned_thumbnails():
             if path and os.path.exists(path) and os.path.isdir(path):
                 valid_dirs.append(path)
         
-        # Build set of existing image hashes
         existing_hashes = set()
         for input_dir in valid_dirs:
             if not os.path.exists(input_dir):
@@ -977,8 +978,6 @@ def cleanup_orphaned_thumbnails():
                     if entry.is_file():
                         ext = os.path.splitext(entry.name)[1].lower()
                         if ext in IMAGE_EXTENSIONS:
-                            # Generate the same hash that would be used for caching
-                            # The actual cache key is "{full_path}:{mtime}"
                             full_path = os.path.join(input_dir, entry.name)
                             try:
                                 mtime = entry.stat().st_mtime
@@ -990,7 +989,6 @@ def cleanup_orphaned_thumbnails():
             except OSError:
                 continue
         
-        # Remove orphaned thumbnails
         orphaned = cached_files - existing_hashes
         removed_count = 0
         for orphaned_file in orphaned:
@@ -1011,7 +1009,6 @@ def cleanup_orphaned_thumbnails():
 async def invalidate_cache(request):
     """Endpoint to manually invalidate cache (called on refresh)."""
     _image_cache.invalidate()
-    # Clean up orphaned thumbnails in background
     _executor.submit(cleanup_orphaned_thumbnails)
     return web.json_response({"status": "ok"})
 
@@ -1055,6 +1052,33 @@ async def get_ui_state(request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
+def _resolve_image_path(image_name, source_folder, actual_source):
+    """
+    Helper: resolve the absolute path of an image given its name, source_folder and actual_source.
+    Returns (input_dir, image_filename, image_path) or None if invalid.
+    """
+    if actual_source and os.path.exists(actual_source) and os.path.isdir(actual_source):
+        image_filename = os.path.basename(image_name)
+        input_dir = actual_source
+    else:
+        image_filename = image_name
+        if source_folder:
+            folders = load_source_folders()
+            source_norm = os.path.normpath(source_folder)
+            valid_source = any(os.path.normpath(f.get('path', '')) == source_norm for f in folders)
+            if valid_source and os.path.exists(source_folder) and os.path.isdir(source_folder):
+                input_dir = source_folder
+            else:
+                input_dir = folder_paths.get_input_directory()
+        else:
+            input_dir = folder_paths.get_input_directory()
+
+    image_path = os.path.normpath(os.path.join(input_dir, image_filename))
+    if not image_path.startswith(os.path.normpath(input_dir)):
+        return None
+    return input_dir, image_filename, image_path
+
+
 class LocalImageGallery:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1062,107 +1086,123 @@ class LocalImageGallery:
             "required": {},
             "hidden": {
                 "unique_id": "UNIQUE_ID",
-                "selected_image": ("STRING", {"default": ""}),
-                "source_folder": ("STRING", {"default": ""})  # NEW
+                # JSON array of selected image names (multi-select)
+                "selected_images": ("STRING", {"default": "[]"}),
+                "source_folder": ("STRING", {"default": ""}),
+                "actual_source": ("STRING", {"default": ""})
             }
         }
 
+    # ---- multi-image output ----
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("IMAGE",)
+    OUTPUT_IS_LIST = (True,)          # output a list of IMAGE tensors (one per selected image)
     FUNCTION = "load_image"
     CATEGORY = "🖼️ Image Gallery"
 
     @classmethod
-    def IS_CHANGED(cls, selected_image="", source_folder="", **kwargs):
-        if not selected_image:
+    def IS_CHANGED(cls, selected_images="[]", source_folder="", actual_source="", **kwargs):
+        if not selected_images or selected_images == "[]":
             return ""
-        root_dir = source_folder if source_folder else folder_paths.get_input_directory()
-        full_path = os.path.join(root_dir, selected_image)
-        mtime = 0
-        if os.path.exists(full_path):
-            mtime = os.path.getmtime(full_path)
+        try:
+            names = json.loads(selected_images)
+        except Exception:
+            names = [selected_images] if selected_images else []
 
-        return f"{full_path}:{mtime}"
-    
+        if not names:
+            return ""
+
+        sig_parts = []
+        for name in names:
+            result = _resolve_image_path(name, source_folder, actual_source)
+            if result is None:
+                continue
+            _, _, image_path = result
+            mtime = 0
+            if os.path.exists(image_path):
+                mtime = os.path.getmtime(image_path)
+            sig_parts.append(f"{image_path}:{mtime}")
+        return "|".join(sig_parts)
+
     @classmethod
-    def VALIDATE_INPUTS(cls, selected_image="", source_folder="", **kwargs):
-        if not selected_image:
+    def VALIDATE_INPUTS(cls, selected_images="[]", source_folder="", actual_source="", **kwargs):
+        if not selected_images or selected_images == "[]":
             return True
-        
-        # Determine input directory
-        if source_folder:
-            folders = load_source_folders()
-            source_norm = os.path.normpath(source_folder)
-            valid_source = any(os.path.normpath(f.get('path', '')) == source_norm for f in folders)
-            
-            if valid_source and os.path.exists(source_folder) and os.path.isdir(source_folder):
-                input_dir = source_folder
-            else:
-                input_dir = folder_paths.get_input_directory()
-        else:
-            input_dir = folder_paths.get_input_directory()
-        
-        image_path = os.path.normpath(os.path.join(input_dir, selected_image))
-        
-        if not image_path.startswith(os.path.normpath(input_dir)):
-            return f"Invalid image path: {selected_image}"
-        
-        if not os.path.exists(image_path):
-            return f"Image not found: {selected_image}"
-        
+        try:
+            names = json.loads(selected_images)
+        except Exception:
+            names = [selected_images] if selected_images else []
+
+        if not names:
+            return True
+
+        for name in names:
+            result = _resolve_image_path(name, source_folder, actual_source)
+            if result is None:
+                return f"Invalid image path: {name}"
+            _, _, image_path = result
+            if not os.path.exists(image_path):
+                return f"Image not found: {name} (path: {image_path})"
+
         return True
 
-    def load_image(self, unique_id, selected_image="", source_folder="", **kwargs):
-        if not selected_image:
+    def load_image(self, unique_id, selected_images="[]", source_folder="", actual_source="", **kwargs):
+        """Load one or more selected images and return as a list of IMAGE tensors."""
+
+        # Parse selected images list
+        if not selected_images or selected_images == "[]":
             print("LocalImageGallery: No image selected, returning blank image.")
             blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (blank,)
-        
-        # Determine input directory
-        if source_folder:
-            folders = load_source_folders()
-            source_norm = os.path.normpath(source_folder)
-            valid_source = any(os.path.normpath(f.get('path', '')) == source_norm for f in folders)
-            
-            if valid_source and os.path.exists(source_folder) and os.path.isdir(source_folder):
-                input_dir = source_folder
-            else:
-                input_dir = folder_paths.get_input_directory()
-        else:
-            input_dir = folder_paths.get_input_directory()
-        
-        image_path = os.path.normpath(os.path.join(input_dir, selected_image))
-        
-        if not image_path.startswith(os.path.normpath(input_dir)):
-            print(f"LocalImageGallery: Invalid path attempted: {image_path}")
-            blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (blank,)
-        
-        if not os.path.exists(image_path):
-            print(f"LocalImageGallery: Image not found: {image_path}")
-            blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (blank,)
-        
+            return ([blank],)
+
         try:
-            img = Image.open(image_path)
-            img = ImageOps.exif_transpose(img)
-            
-            if img.mode == 'I':
-                img = img.point(lambda i: i * (1 / 255))
-            
-            img = img.convert("RGB")
-            
-            img_array = np.array(img).astype(np.float32) / 255.0
-            img_tensor = torch.from_numpy(img_array).unsqueeze(0)
-            
-            return (img_tensor,)
-            
-        except Exception as e:
-            print(f"LocalImageGallery: Error loading image '{selected_image}': {e}")
-            import traceback
-            traceback.print_exc()
+            names = json.loads(selected_images)
+        except Exception:
+            names = [selected_images] if selected_images else []
+
+        if not names:
             blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (blank,)
+            return ([blank],)
+
+        tensors = []
+        for name in names:
+            result = _resolve_image_path(name, source_folder, actual_source)
+            if result is None:
+                print(f"LocalImageGallery: Invalid path for image '{name}', skipping.")
+                continue
+
+            _, _, image_path = result
+
+            if not os.path.exists(image_path):
+                print(f"LocalImageGallery: Image not found: {image_path}, skipping.")
+                continue
+
+            try:
+                img = Image.open(image_path)
+                img = ImageOps.exif_transpose(img)
+
+                if img.mode == 'I':
+                    img = img.point(lambda i: i * (1 / 255))
+
+                img = img.convert("RGB")
+                img_array = np.array(img).astype(np.float32) / 255.0
+                # Each tensor shape: (1, H, W, 3)
+                img_tensor = torch.from_numpy(img_array).unsqueeze(0)
+                tensors.append(img_tensor)
+
+            except Exception as e:
+                print(f"LocalImageGallery: Error loading image '{name}': {e}")
+                import traceback
+                traceback.print_exc()
+
+        if not tensors:
+            blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return ([blank],)
+
+        # Return as list — each element is a (1, H, W, 3) tensor
+        # ComfyUI will treat each list item as a separate IMAGE output
+        return (tensors,)
+
 
 NODE_CLASS_MAPPINGS = {
     "LocalImageGallery": LocalImageGallery
