@@ -534,4 +534,3 @@ export class FolderManager {
 
 // Singleton instance
 export const folderManager = new FolderManager();
-
