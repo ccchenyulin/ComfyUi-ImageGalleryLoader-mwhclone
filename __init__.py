@@ -168,7 +168,9 @@ save_ui_state = lambda data: save_json_file(data, UI_STATE_FILE)
 
 
 def has_comfyui_metadata_fast(image_path, mtime=None):
-    """Check if a PNG file has ComfyUI metadata with caching."""
+    """
+    Check if a PNG file has ComfyUI metadata with caching.
+    """
     if not image_path.lower().endswith('.png'):
         return False
     
@@ -236,6 +238,7 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
             
             images, folders_list, mtimes = _image_cache.get_directory_listing(folder_path, recursive=False)
             
+            # Prefix images with folder name for uniqueness
             folder_name = folder_config.get('name', os.path.basename(folder_path))
             for img in images:
                 prefixed_name = f"[{folder_name}] {img}"
@@ -249,6 +252,7 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
             
             all_folders.update(folders_list)
         
+        # Apply metadata filter
         if metadata_filter != "all":
             filtered_images = []
             for img_data in all_images:
@@ -261,6 +265,7 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
                     filtered_images.append(img_data)
             all_images = filtered_images
         
+        # Apply sorting
         if sort_by == "date":
             all_images = sorted(all_images, key=lambda x: x['mtime'], reverse=True)
         elif sort_by == "date_asc":
@@ -270,6 +275,7 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
         
         return all_images, sorted(list(all_folders)), all_mtimes, "__ALL__"
     
+    # --- 单个文件夹模式 ---
     root_source_dir = folder_paths.get_input_directory()
     if source_folder:
         folders = load_source_folders()
@@ -279,18 +285,22 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
         if valid_source and os.path.exists(source_folder) and os.path.isdir(source_folder):
             root_source_dir = source_folder
 
+    # 确定最终扫描的根目录
     scan_root = root_source_dir
     if subfolder:
         potential_path = os.path.normpath(os.path.join(root_source_dir, subfolder))
+        # 安全检查：防止目录遍历
         if os.path.commonpath([root_source_dir, potential_path]) == os.path.commonpath([root_source_dir]):
              if os.path.exists(potential_path) and os.path.isdir(potential_path):
                  scan_root = potential_path
              else:
                  return [], [], {}, root_source_dir
 
+    # 扫描目录（传入recursive参数）
     actual_recursive = recursive if not subfolder else False
     all_images_rel, all_folders, mtimes = _image_cache.get_directory_listing(scan_root, actual_recursive)
 
+    # 把相对路径统一转为相对于根source_folder的完整路径
     all_images = []
     for img_rel_path in all_images_rel:
         if subfolder:
@@ -308,6 +318,7 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
             'mtime': mtimes.get(img_rel_path, 0)
         })
     
+    # Apply metadata filter
     if metadata_filter != "all":
         filtered_images = []
         for img_data in all_images:
@@ -321,6 +332,7 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
                 filtered_images.append(img_data)
         all_images = filtered_images
     
+    # Apply sorting
     if sort_by == "date":
         all_images = sorted(all_images, key=lambda x: x['mtime'], reverse=True)
     elif sort_by == "date_asc":
@@ -813,36 +825,79 @@ async def get_images_endpoint(request):
 
 @server.PromptServer.instance.routes.get("/imagegallery/get_subfolders")
 async def get_subfolders(request):
+    """
+    Get immediate child subdirectories of a given path within a source folder.
+    
+    Query params:
+      - source: the root source folder path (must be in configured folders)
+      - parent: relative path within the source folder to list children of.
+                Empty string or omitted means list children of the source root.
+    
+    Returns: { subfolders: ["name1", "name2", ...], has_children: { "name1": true, ... } }
+    """
     try:
         source = request.query.get('source', '')
+        parent = request.query.get('parent', '')  # relative path within source
+
         if not source or source == '__ALL__':
-            return web.json_response({"subfolders": []})
+            return web.json_response({"subfolders": [], "has_children": {}})
 
         source = urllib.parse.unquote(source)
-        
+        parent = urllib.parse.unquote(parent)
+
+        # Security: validate source folder
         folders = load_source_folders()
         source_norm = os.path.normpath(source)
         valid_source = any(os.path.normpath(f.get('path', '')) == source_norm for f in folders)
-        
+
         if not valid_source:
             input_dir = os.path.normpath(folder_paths.get_input_directory())
             if source_norm != input_dir:
-                return web.json_response({"subfolders": []}, status=403)
+                return web.json_response({"subfolders": [], "has_children": {}}, status=403)
+
+        # Resolve the directory to scan
+        if parent:
+            # Security: prevent directory traversal
+            scan_dir = os.path.normpath(os.path.join(source, parent))
+            if not scan_dir.startswith(source_norm):
+                return web.json_response({"subfolders": [], "has_children": {}}, status=403)
+        else:
+            scan_dir = source
+
+        if not os.path.exists(scan_dir):
+            return web.json_response({"subfolders": [], "has_children": {}})
 
         subfolders = []
-        if os.path.exists(source):
-            try:
-                with os.scandir(source) as it:
-                    for entry in it:
-                        if entry.is_dir() and not entry.name.startswith('.'):
-                            subfolders.append(entry.name)
-            except OSError:
-                pass
-                
-        return web.json_response({"subfolders": sorted(subfolders, key=lambda x: x.lower())})
+        has_children = {}
+
+        try:
+            with os.scandir(scan_dir) as it:
+                for entry in it:
+                    if entry.is_dir() and not entry.name.startswith('.'):
+                        subfolders.append(entry.name)
+                        # Check whether this subfolder itself has child directories
+                        child_has_dirs = False
+                        try:
+                            with os.scandir(entry.path) as child_it:
+                                for child_entry in child_it:
+                                    if child_entry.is_dir() and not child_entry.name.startswith('.'):
+                                        child_has_dirs = True
+                                        break
+                        except OSError:
+                            pass
+                        has_children[entry.name] = child_has_dirs
+        except OSError:
+            pass
+
+        subfolders_sorted = sorted(subfolders, key=lambda x: x.lower())
+
+        return web.json_response({
+            "subfolders": subfolders_sorted,
+            "has_children": has_children
+        })
     except Exception as e:
         print(f"Error in get_subfolders: {e}")
-        return web.json_response({"subfolders": []})
+        return web.json_response({"subfolders": [], "has_children": {}})
 
 @server.PromptServer.instance.routes.get("/imagegallery/thumb")
 async def get_thumbnail(request):
@@ -1042,8 +1097,8 @@ async def get_ui_state(request):
 
 def _resolve_image_path(image_name, source_folder, actual_source):
     """
-    Helper: resolve the absolute path of an image given its name and source info.
-    Returns (image_path, input_dir) or (None, None) on failure.
+    Helper: resolve the absolute path of an image given its name, source_folder and actual_source.
+    Returns (input_dir, image_filename, image_path) or None if invalid.
     """
     if actual_source and os.path.exists(actual_source) and os.path.isdir(actual_source):
         image_filename = os.path.basename(image_name)
@@ -1063,8 +1118,8 @@ def _resolve_image_path(image_name, source_folder, actual_source):
 
     image_path = os.path.normpath(os.path.join(input_dir, image_filename))
     if not image_path.startswith(os.path.normpath(input_dir)):
-        return None, None
-    return image_path, input_dir
+        return None
+    return input_dir, image_filename, image_path
 
 
 class LocalImageGallery:
@@ -1074,111 +1129,95 @@ class LocalImageGallery:
             "required": {},
             "hidden": {
                 "unique_id": "UNIQUE_ID",
-                # Multi-select: JSON array of {name, source, actual_source}
-                "selected_images_json": ("STRING", {"default": "[]"}),
-                # Legacy single-select fields (kept for backward compatibility)
-                "selected_image": ("STRING", {"default": ""}),
+                # JSON array of selected image names (multi-select)
+                "selected_images": ("STRING", {"default": "[]"}),
                 "source_folder": ("STRING", {"default": ""}),
                 "actual_source": ("STRING", {"default": ""})
             }
         }
 
+    # ---- multi-image output ----
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("IMAGE",)
+    OUTPUT_IS_LIST = (True,)          # output a list of IMAGE tensors (one per selected image)
     FUNCTION = "load_image"
     CATEGORY = "🖼️ Image Gallery"
 
     @classmethod
-    def IS_CHANGED(cls, selected_images_json="[]", selected_image="", source_folder="", actual_source="", **kwargs):
-        """Change detection: hash all selected image mtimes."""
+    def IS_CHANGED(cls, selected_images="[]", source_folder="", actual_source="", **kwargs):
+        if not selected_images or selected_images == "[]":
+            return ""
         try:
-            selected_list = json.loads(selected_images_json) if selected_images_json else []
+            names = json.loads(selected_images)
         except Exception:
-            selected_list = []
+            names = [selected_images] if selected_images else []
 
-        # Backward compat: fall back to single-select fields
-        if not selected_list and selected_image:
-            selected_list = [{"name": selected_image, "source": source_folder, "actual_source": actual_source}]
-
-        if not selected_list:
+        if not names:
             return ""
 
-        hash_parts = []
-        for item in selected_list:
-            img_name = item.get("name", "")
-            src = item.get("source", "")
-            actual_src = item.get("actual_source", "")
-            image_path, _ = _resolve_image_path(img_name, src, actual_src)
-            if image_path and os.path.exists(image_path):
+        sig_parts = []
+        for name in names:
+            result = _resolve_image_path(name, source_folder, actual_source)
+            if result is None:
+                continue
+            _, _, image_path = result
+            mtime = 0
+            if os.path.exists(image_path):
                 mtime = os.path.getmtime(image_path)
-                hash_parts.append(f"{image_path}:{mtime}")
-            else:
-                hash_parts.append(img_name)
-
-        return "|".join(hash_parts)
+            sig_parts.append(f"{image_path}:{mtime}")
+        return "|".join(sig_parts)
 
     @classmethod
-    def VALIDATE_INPUTS(cls, selected_images_json="[]", selected_image="", source_folder="", actual_source="", **kwargs):
-        """Validate all selected images exist."""
+    def VALIDATE_INPUTS(cls, selected_images="[]", source_folder="", actual_source="", **kwargs):
+        if not selected_images or selected_images == "[]":
+            return True
         try:
-            selected_list = json.loads(selected_images_json) if selected_images_json else []
+            names = json.loads(selected_images)
         except Exception:
-            selected_list = []
+            names = [selected_images] if selected_images else []
 
-        # Backward compat
-        if not selected_list and selected_image:
-            selected_list = [{"name": selected_image, "source": source_folder, "actual_source": actual_source}]
-
-        if not selected_list:
+        if not names:
             return True
 
-        for item in selected_list:
-            img_name = item.get("name", "")
-            if not img_name:
-                continue
-            src = item.get("source", "")
-            actual_src = item.get("actual_source", "")
-            image_path, input_dir = _resolve_image_path(img_name, src, actual_src)
-
-            if image_path is None:
-                return f"Invalid image path: {img_name}"
-
+        for name in names:
+            result = _resolve_image_path(name, source_folder, actual_source)
+            if result is None:
+                return f"Invalid image path: {name}"
+            _, _, image_path = result
             if not os.path.exists(image_path):
-                return f"Image not found: {img_name} (path: {image_path})"
+                return f"Image not found: {name} (path: {image_path})"
 
         return True
 
-    def load_image(self, unique_id, selected_images_json="[]", selected_image="", source_folder="", actual_source="", **kwargs):
-        """Load all selected images and return as a batched tensor (N, H, W, C)."""
-        try:
-            selected_list = json.loads(selected_images_json) if selected_images_json else []
-        except Exception:
-            selected_list = []
+    def load_image(self, unique_id, selected_images="[]", source_folder="", actual_source="", **kwargs):
+        """Load one or more selected images and return as a list of IMAGE tensors."""
 
-        # Backward compat: single-select fallback
-        if not selected_list and selected_image:
-            selected_list = [{"name": selected_image, "source": source_folder, "actual_source": actual_source}]
-
-        if not selected_list:
+        # Parse selected images list
+        if not selected_images or selected_images == "[]":
             print("LocalImageGallery: No image selected, returning blank image.")
             blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (blank,)
+            return ([blank],)
+
+        try:
+            names = json.loads(selected_images)
+        except Exception:
+            names = [selected_images] if selected_images else []
+
+        if not names:
+            blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return ([blank],)
 
         tensors = []
-        for item in selected_list:
-            img_name = item.get("name", "")
-            if not img_name:
+        for name in names:
+            result = _resolve_image_path(name, source_folder, actual_source)
+            if result is None:
+                print(f"LocalImageGallery: Invalid path for image '{name}', skipping.")
                 continue
-            src = item.get("source", "")
-            actual_src = item.get("actual_source", "")
-            image_path, input_dir = _resolve_image_path(img_name, src, actual_src)
 
-            if image_path is None:
-                print(f"LocalImageGallery: Invalid path attempted for: {img_name}")
-                continue
+            _, _, image_path = result
 
             if not os.path.exists(image_path):
-                print(f"LocalImageGallery: Image not found: {image_path}")
+                print(f"LocalImageGallery: Image not found: {image_path}, skipping.")
                 continue
 
             try:
@@ -1190,36 +1229,22 @@ class LocalImageGallery:
 
                 img = img.convert("RGB")
                 img_array = np.array(img).astype(np.float32) / 255.0
-                tensors.append(torch.from_numpy(img_array))
+                # Each tensor shape: (1, H, W, 3)
+                img_tensor = torch.from_numpy(img_array).unsqueeze(0)
+                tensors.append(img_tensor)
+
             except Exception as e:
-                print(f"LocalImageGallery: Error loading image '{img_name}': {e}")
+                print(f"LocalImageGallery: Error loading image '{name}': {e}")
                 import traceback
                 traceback.print_exc()
 
         if not tensors:
-            print("LocalImageGallery: No valid images loaded, returning blank.")
             blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (blank,)
+            return ([blank],)
 
-        if len(tensors) == 1:
-            return (tensors[0].unsqueeze(0),)
-
-        # Pad all images to the same HxW (max dimensions across batch)
-        max_h = max(t.shape[0] for t in tensors)
-        max_w = max(t.shape[1] for t in tensors)
-
-        padded = []
-        for t in tensors:
-            h, w, c = t.shape
-            if h == max_h and w == max_w:
-                padded.append(t)
-            else:
-                pad = torch.zeros((max_h, max_w, c), dtype=torch.float32)
-                pad[:h, :w, :] = t
-                padded.append(pad)
-
-        batch = torch.stack(padded, dim=0)  # (N, H, W, C)
-        return (batch,)
+        # Return as list — each element is a (1, H, W, 3) tensor
+        # ComfyUI will treat each list item as a separate IMAGE output
+        return (tensors,)
 
 
 NODE_CLASS_MAPPINGS = {

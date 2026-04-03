@@ -53,24 +53,25 @@ const LocalImageGalleryNode = {
                 totalPages: 1,
                 availableImages: [],
                 availableFolders: [],
-                // ===== 多选状态 =====
-                // selectedImages: Map<key, {name, source, actual_source, width, height}>
-                // key = `${original_name}::${source}`
-                selectedImages: new Map(),
-                // 用于 Shift+点击范围选择的锚点索引（基于 filteredImages）
+                selectedImages: new Set(),
+                selectedImageSources: new Map(),
                 lastClickedIndex: -1,
-                // ===== （保留）单选兼容字段 =====
                 selectedImage: "",
                 selectedImageSource: "",
                 selectedOriginalName: "",
                 selectedImageWidth: 0,
                 selectedImageHeight: 0,
-                // ===========================
                 currentFolder: "",
                 currentSourceFolder: "",   
                 availableSourceFolders: [],
-                currentSubfolder: "",
-                availableSubfolders: [], 
+                // ---- hierarchical subfolder state ----
+                // subfolderPath: array of folder name segments, e.g. ["animals", "cats"]
+                // represents the currently selected path relative to currentSourceFolder
+                subfolderPath: [],
+                // subfolderLevels: array of { items: string[], hasChildren: {name: bool} }
+                // one entry per depth level that is currently expanded
+                subfolderLevels: [],
+                // ---- end hierarchical ----
                 metadataFilter: "all",
                 sortOrder: "name",
                 recursive: false,
@@ -105,75 +106,31 @@ const LocalImageGalleryNode = {
                 return result;
             };
 
-            // ===== 多选辅助函数 =====
-            const makeSelectionKey = (originalName, source) => `${originalName}::${source || ""}`;
-
-            const isImageSelected = (originalName, source) => {
-                return state.selectedImages.has(makeSelectionKey(originalName, source));
-            };
-
-            /** 将 Map 序列化为 JSON 字符串，同步到 hidden widget */
-            const serializeSelectedImages = () => {
-                const arr = Array.from(state.selectedImages.values()).map(item => ({
-                    name: item.name,
-                    source: item.source,
-                    actual_source: item.actual_source || ""
-                }));
-                return JSON.stringify(arr);
-            };
-
-            /** 从 filteredImages 数组里找某条图片的索引 */
-            const findImageIndex = (originalName, source) => {
-                const filtered = getFilteredImages();
-                return filtered.findIndex(img =>
-                    img.original_name === originalName &&
-                    (img.source || "") === (source || "")
-                );
-            };
-
-            // Hidden widgets
+            // ---- Hidden widgets ----
             const galleryIdWidget = this.addWidget("hidden_text", "image_gallery_unique_id_widget", 
                 this.properties.image_gallery_unique_id, () => {}, {});
             galleryIdWidget.serializeValue = () => this.properties.image_gallery_unique_id;
             galleryIdWidget.draw = () => {};
             galleryIdWidget.computeSize = () => [0, 0];
 
-            // Multi-select JSON widget (primary)
-            const selectedImagesJsonWidget = this.addWidget("hidden_text", "selected_images_json",
-                "[]", () => {}, { multiline: false });
-            selectedImagesJsonWidget.serializeValue = () => serializeSelectedImages();
-            selectedImagesJsonWidget.draw = () => {};
-            selectedImagesJsonWidget.computeSize = () => [0, 0];
-
-            // Legacy single-select widget (backward compat)
-            const selectionWidget = this.addWidget("hidden_text", "selected_image",
-                this.properties.selected_image || "", () => {}, { multiline: false });
+            const selectionWidget = this.addWidget("hidden_text", "selected_images",
+                this.properties.selected_images || "[]", () => {}, { multiline: false });
             selectionWidget.serializeValue = () => {
-                // Export first selected image for legacy support
-                const first = state.selectedImages.size > 0
-                    ? Array.from(state.selectedImages.values())[0]
-                    : null;
-                return first ? first.name : (node.properties["selected_image"] || "");
+                return node.properties["selected_images"] || "[]";
             };
 
             const sourceFolderWidget = this.addWidget("hidden_text", "source_folder",
                 this.properties.source_folder || "", () => {}, { multiline: false });
             sourceFolderWidget.serializeValue = () => {
-                const first = state.selectedImages.size > 0
-                    ? Array.from(state.selectedImages.values())[0]
-                    : null;
-                return first ? (first.source || "") : (node.properties["source_folder"] || "");
+                return node.properties["source_folder"] || "";
             };
 
             const actualSourceWidget = this.addWidget("hidden_text", "actual_source",
                 this.properties.actual_source || "", () => {}, { multiline: false });
             actualSourceWidget.serializeValue = () => {
-                const first = state.selectedImages.size > 0
-                    ? Array.from(state.selectedImages.values())[0]
-                    : null;
-                return first ? (first.actual_source || "") : (node.properties["actual_source"] || "");
+                return node.properties["actual_source"] || "";
             };
-            
+
             // Create container
             const widgetContainer = document.createElement("div");
             widgetContainer.className = "localimage-container-wrapper";
@@ -192,14 +149,11 @@ const LocalImageGalleryNode = {
                         <div class="localimage-selected-display">
                             <span class="label">Selected:</span>
                             <span class="selected-name" title="">None</span>
-                            <button class="clear-selection-btn" title="Clear all selections" style="display:none;">✕ Clear</button>
+                            <span class="selected-count" style="display:none;"></span>
                         </div>
                         <div class="localimage-controls">
                             <input type="text" class="search-input" placeholder="🔍 Search images...">
                             <select class="source-folder-select" title="Source folder">
-                                <option value="">Loading...</option>
-                            </select>
-                            <select class="subfolder-select" title="Filter by subfolder" disabled>
                                 <option value="">Loading...</option>
                             </select>
                             <select class="metadata-filter-select" title="Filter by metadata">
@@ -214,13 +168,15 @@ const LocalImageGalleryNode = {
                             </select>
                             <button class="refresh-btn" title="Refresh image list">🔄</button>
                         </div>
-                         <div class="localimage-size-control">
+                        <div class="localimage-subfolder-nav"></div>
+                        <div class="localimage-size-control">
                               <span class="size-label size-label-small">🖼️</span>
                               <input type="range" class="size-slider" min="50" max="400" value="110" title="Preview size">
                               <span class="size-label size-label-large">🖼️</span>
                               <button class="preview-mode-toggle" title="Toggle preview mode">🔍</button>
                               <button class="auto-hide-toggle" title="Toggle auto-hide preview">👁️</button>
                               <button class="recursive-toggle" title="Include subfolders">📂</button>
+                              <button class="clear-selection-btn" title="Clear all selections" style="display:none;">✖ Clear</button>
                               <button class="folder-manager-btn" title="Manage source folders">📁 Folder Manager</button>
                               <button class="load-image-btn" title="Load image from computer">📂 Load Image</button>
                               <input type="file" class="file-input-hidden" accept="image/*" multiple style="display: none;">
@@ -241,7 +197,7 @@ const LocalImageGalleryNode = {
             els.viewport = widgetContainer.querySelector(".localimage-gallery-viewport");
             els.searchInput = widgetContainer.querySelector(".search-input");
             els.selectedName = widgetContainer.querySelector(".selected-name");
-            els.clearSelectionBtn = widgetContainer.querySelector(".clear-selection-btn");
+            els.selectedCount = widgetContainer.querySelector(".selected-count");
             els.refreshBtn = widgetContainer.querySelector(".refresh-btn");
             els.metadataSelect = widgetContainer.querySelector(".metadata-filter-select");
             els.sortSelect = widgetContainer.querySelector(".sort-order-select");
@@ -252,18 +208,303 @@ const LocalImageGalleryNode = {
             els.loadImageBtn = widgetContainer.querySelector(".load-image-btn");
             els.fileInput = widgetContainer.querySelector(".file-input-hidden");
             els.sourceSelect = widgetContainer.querySelector(".source-folder-select");
-            els.subfolderSelect = widgetContainer.querySelector(".subfolder-select");
+            els.subfolderNav = widgetContainer.querySelector(".localimage-subfolder-nav");
             els.folderManagerBtn = widgetContainer.querySelector(".folder-manager-btn");
             els.previewModeToggle = widgetContainer.querySelector(".preview-mode-toggle");
             els.autoHideToggle = widgetContainer.querySelector(".auto-hide-toggle");
             els.recursiveToggle = widgetContainer.querySelector(".recursive-toggle");
+            els.clearSelectionBtn = widgetContainer.querySelector(".clear-selection-btn");
 
             const cacheHeights = () => {
                 if (els.controls) state.cachedHeights.controls = els.controls.offsetHeight;
                 if (els.selectedDisplay) state.cachedHeights.selectedDisplay = els.selectedDisplay.offsetHeight;
             };
 
-            // === CONTEXT MENU ===
+            // ================================================================
+            // HIERARCHICAL SUBFOLDER NAVIGATION
+            // ================================================================
+
+            /**
+             * Get the current subfolder path as a joined string (e.g. "animals/cats")
+             */
+            const getCurrentSubfolderStr = () => state.subfolderPath.join('/');
+
+            /**
+             * Load children of a given relative parent path within the current source folder.
+             * Returns { subfolders: string[], has_children: { name: bool } }
+             */
+            const loadSubfolderChildren = async (parentRelPath) => {
+                const source = state.currentSourceFolder;
+                if (!source || source === '__ALL__') return { subfolders: [], has_children: {} };
+                try {
+                    const sourceEncoded = encodeURIComponent(source);
+                    const parentEncoded = encodeURIComponent(parentRelPath || '');
+                    const response = await api.fetchApi(
+                        `/imagegallery/get_subfolders?source=${sourceEncoded}&parent=${parentEncoded}`
+                    );
+                    return await response.json();
+                } catch (e) {
+                    console.error('Failed to load subfolders:', e);
+                    return { subfolders: [], has_children: {} };
+                }
+            };
+
+            /**
+             * Render the subfolder navigation bar.
+             *
+             * Layout:
+             *   [Root ▾] [> segment1 ▾] [> segment2 ▾] ...
+             *
+             * Each segment is a <select> showing siblings at that depth.
+             * Selecting a value drills down; the first option is always "(All)" which trims
+             * the path to that depth.
+             *
+             * state.subfolderLevels[i] = { items: string[], hasChildren: { name: bool } }
+             * state.subfolderPath[i]   = currently chosen name at depth i  (or '' = "All")
+             */
+            const renderSubfolderNav = () => {
+                els.subfolderNav.innerHTML = '';
+
+                if (!state.currentSourceFolder || state.currentSourceFolder === '__ALL__') {
+                    els.subfolderNav.style.display = 'none';
+                    return;
+                }
+
+                // Always show at least the root level selector
+                if (state.subfolderLevels.length === 0) {
+                    els.subfolderNav.style.display = 'none';
+                    return;
+                }
+
+                els.subfolderNav.style.display = 'flex';
+
+                state.subfolderLevels.forEach((level, depth) => {
+                    if (depth > 0) {
+                        const sep = document.createElement('span');
+                        sep.className = 'subfolder-sep';
+                        sep.textContent = '›';
+                        els.subfolderNav.appendChild(sep);
+                    }
+
+                    const select = document.createElement('select');
+                    select.className = 'subfolder-level-select';
+                    select.title = depth === 0
+                        ? 'Root subfolder'
+                        : `Level ${depth + 1} subfolder`;
+
+                    // First option: "All" at this depth (path truncated to depth-1)
+                    const allOpt = document.createElement('option');
+                    allOpt.value = '';
+                    allOpt.textContent = depth === 0 ? '📁 All subfolders' : '· All';
+                    select.appendChild(allOpt);
+
+                    level.items.forEach(name => {
+                        const opt = document.createElement('option');
+                        opt.value = name;
+                        // Show ▸ indicator when folder has deeper children
+                        const hasKids = level.hasChildren && level.hasChildren[name];
+                        opt.textContent = (hasKids ? '▸ ' : '') + name;
+                        select.appendChild(opt);
+                    });
+
+                    // Set current value
+                    const currentVal = state.subfolderPath[depth] || '';
+                    select.value = currentVal;
+
+                    select.addEventListener('change', async () => {
+                        const chosen = select.value;
+
+                        if (!chosen) {
+                            // "All" selected at this depth → trim path to depth-1 and levels to depth
+                            state.subfolderPath = state.subfolderPath.slice(0, depth);
+                            state.subfolderLevels = state.subfolderLevels.slice(0, depth);
+                        } else {
+                            // A folder was chosen at this depth
+                            state.subfolderPath = [...state.subfolderPath.slice(0, depth), chosen];
+                            state.subfolderLevels = state.subfolderLevels.slice(0, depth + 1);
+
+                            // Check if chosen folder has children; if so, load and append next level
+                            const hasKids = level.hasChildren && level.hasChildren[chosen];
+                            if (hasKids) {
+                                const parentRel = state.subfolderPath.join('/');
+                                const childData = await loadSubfolderChildren(parentRel);
+                                if (childData.subfolders && childData.subfolders.length > 0) {
+                                    state.subfolderLevels.push({
+                                        items: childData.subfolders,
+                                        hasChildren: childData.has_children || {}
+                                    });
+                                }
+                            }
+                        }
+
+                        renderSubfolderNav();
+                        saveSubfolderState();
+                        fetchAndRender(false);
+                    });
+
+                    els.subfolderNav.appendChild(select);
+                });
+            };
+
+            /**
+             * Initialize subfolder navigation for the current source folder.
+             * Loads the root level and restores saved path if applicable.
+             */
+            const initSubfolderNav = async (savedPath) => {
+                state.subfolderPath = [];
+                state.subfolderLevels = [];
+
+                if (!state.currentSourceFolder || state.currentSourceFolder === '__ALL__') {
+                    renderSubfolderNav();
+                    return;
+                }
+
+                // Load root level
+                const rootData = await loadSubfolderChildren('');
+                if (!rootData.subfolders || rootData.subfolders.length === 0) {
+                    renderSubfolderNav();
+                    return;
+                }
+
+                state.subfolderLevels.push({
+                    items: rootData.subfolders,
+                    hasChildren: rootData.has_children || {}
+                });
+
+                // Restore saved path level by level
+                if (savedPath && Array.isArray(savedPath) && savedPath.length > 0) {
+                    for (let depth = 0; depth < savedPath.length; depth++) {
+                        const seg = savedPath[depth];
+                        const level = state.subfolderLevels[depth];
+                        if (!level || !level.items.includes(seg)) break;
+
+                        state.subfolderPath.push(seg);
+
+                        const hasKids = level.hasChildren && level.hasChildren[seg];
+                        if (hasKids) {
+                            const parentRel = state.subfolderPath.join('/');
+                            const childData = await loadSubfolderChildren(parentRel);
+                            if (childData.subfolders && childData.subfolders.length > 0) {
+                                state.subfolderLevels.push({
+                                    items: childData.subfolders,
+                                    hasChildren: childData.has_children || {}
+                                });
+                            } else {
+                                break; // no deeper levels
+                            }
+                        } else {
+                            break; // no further depth to restore
+                        }
+                    }
+                }
+
+                renderSubfolderNav();
+            };
+
+            const saveSubfolderState = () => {
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, {
+                    subfolder_path: state.subfolderPath,
+                    current_source_folder: state.currentSourceFolder,
+                });
+            };
+
+            // ================================================================
+            // MULTI-SELECT HELPERS
+            // ================================================================
+
+            const toggleImageSelection = (originalName, imageSource) => {
+                if (state.selectedImages.has(originalName)) {
+                    state.selectedImages.delete(originalName);
+                    state.selectedImageSources.delete(originalName);
+                } else {
+                    state.selectedImages.add(originalName);
+                    state.selectedImageSources.set(originalName, imageSource || "");
+                }
+            };
+
+            const selectRange = (fromIndex, toIndex) => {
+                const filteredImages = getFilteredImages();
+                const lo = Math.min(fromIndex, toIndex);
+                const hi = Math.max(fromIndex, toIndex);
+                for (let i = lo; i <= hi; i++) {
+                    if (i >= 0 && i < filteredImages.length) {
+                        const img = filteredImages[i];
+                        state.selectedImages.add(img.original_name || img.name);
+                        state.selectedImageSources.set(
+                            img.original_name || img.name,
+                            img.source || state.currentSourceFolder
+                        );
+                    }
+                }
+            };
+
+            const updateSelection = () => {
+                const namesArray = Array.from(state.selectedImages);
+                const jsonValue = JSON.stringify(namesArray);
+
+                node.setProperty("selected_images", jsonValue);
+                node.setProperty("source_folder", state.currentSourceFolder);
+
+                const firstSource = namesArray.length > 0
+                    ? (state.selectedImageSources.get(namesArray[0]) || state.currentSourceFolder)
+                    : "";
+                node.setProperty("actual_source", firstSource);
+
+                const widget = node.widgets.find(w => w.name === "selected_images");
+                if (widget) widget.value = jsonValue;
+
+                const sourceWidget = node.widgets.find(w => w.name === "source_folder");
+                if (sourceWidget) sourceWidget.value = state.currentSourceFolder;
+
+                const actualSourceWidget = node.widgets.find(w => w.name === "actual_source");
+                if (actualSourceWidget) actualSourceWidget.value = firstSource;
+
+                const count = state.selectedImages.size;
+                if (count === 0) {
+                    els.selectedName.textContent = "None";
+                    els.selectedName.title = "None";
+                    els.selectedCount.style.display = "none";
+                    els.clearSelectionBtn.style.display = "none";
+                } else if (count === 1) {
+                    const name = namesArray[0];
+                    let displayName = name;
+                    const imgData = state.availableImages.find(i =>
+                        (i.original_name || i.name) === name
+                    );
+                    if (imgData && imgData.width && imgData.height) {
+                        displayName += ` (${imgData.width} × ${imgData.height})`;
+                    }
+                    els.selectedName.textContent = displayName;
+                    els.selectedName.title = displayName;
+                    els.selectedCount.style.display = "none";
+                    els.clearSelectionBtn.style.display = "inline-flex";
+                } else {
+                    els.selectedName.textContent = `${count} images selected`;
+                    els.selectedName.title = namesArray.join("\n");
+                    els.selectedCount.textContent = `×${count}`;
+                    els.selectedCount.style.display = "inline-block";
+                    els.clearSelectionBtn.style.display = "inline-flex";
+                }
+
+                els.viewport.querySelectorAll('.localimage-image-card').forEach(card => {
+                    const cardOriginalName = card.dataset.originalName;
+                    card.classList.toggle('selected', state.selectedImages.has(cardOriginalName));
+                });
+
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
+                    selected_images: jsonValue,
+                    current_source_folder: state.currentSourceFolder,
+                    metadata_filter: state.metadataFilter,
+                    sort_order: state.sortOrder,
+                    preview_size: state.previewSize,
+                    preview_mode: state.previewMode,
+                    auto_hide_preview: state.autoHidePreview
+                });
+            };
+
+            // ================================================================
+            // CONTEXT MENU
+            // ================================================================
             const showContextMenu = (e, imageData) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -272,6 +513,10 @@ const LocalImageGalleryNode = {
                 
                 const menu = document.createElement('div');
                 menu.className = 'localimage-context-menu';
+
+                const isInSelection = state.selectedImages.has(imageData.originalName || imageData.name);
+                const selectionCount = state.selectedImages.size;
+
                 menu.innerHTML = `
                     <div class="localimage-context-menu-item preview-item" data-action="preview">
                         <span class="icon">🔍</span>
@@ -282,9 +527,26 @@ const LocalImageGalleryNode = {
                         <span class="label">Paste Image</span>
                     </div>
                     <div class="localimage-context-menu-separator"></div>
+                    ${selectionCount > 1 && isInSelection ? `
+                    <div class="localimage-context-menu-item select-all-item" data-action="select-all">
+                        <span class="icon">☑️</span>
+                        <span class="label">Select All Visible</span>
+                    </div>
+                    <div class="localimage-context-menu-item deselect-all-item" data-action="deselect-all">
+                        <span class="icon">🔲</span>
+                        <span class="label">Clear Selection</span>
+                    </div>
+                    <div class="localimage-context-menu-separator"></div>
+                    ` : `
+                    <div class="localimage-context-menu-item select-all-item" data-action="select-all">
+                        <span class="icon">☑️</span>
+                        <span class="label">Select All Visible</span>
+                    </div>
+                    <div class="localimage-context-menu-separator"></div>
+                    `}
                     <div class="localimage-context-menu-item delete-item" data-action="delete">
                         <span class="icon">🗑️</span>
-                        <span class="label">Delete Image</span>
+                        <span class="label">Delete Image${selectionCount > 1 && isInSelection ? ` (${selectionCount} selected)` : ''}</span>
                     </div>
                 `;
                 
@@ -298,11 +560,24 @@ const LocalImageGalleryNode = {
                     const action = item.dataset.action;
                     
                     if (action === 'delete') {
-                        await deleteImage(imageData);
+                        if (selectionCount > 1 && isInSelection) {
+                            await deleteSelectedImages();
+                        } else {
+                            await deleteImage(imageData);
+                        }
                     } else if (action === 'paste') {
                         await pasteImageFromClipboard();
                     } else if (action === 'preview') {
                         showPreviewModal(imageData);
+                    } else if (action === 'select-all') {
+                        selectAllVisible();
+                    } else if (action === 'deselect-all') {
+                        state.selectedImages.clear();
+                        state.selectedImageSources.clear();
+                        state.lastClickedIndex = -1;
+                        updateSelection();
+                        state.visibleRange = { start: 0, end: 0 };
+                        renderVisibleCards();
                     }
                     
                     LocalImageGalleryNode.closeContextMenu();
@@ -333,6 +608,9 @@ const LocalImageGalleryNode = {
                 }, 0);
             };
 
+            // ================================================================
+            // PREVIEW MODAL
+            // ================================================================
             const showPreviewModal = (imageData) => {
                 const imageName = imageData.originalName || imageData.name;
                 const imageSource = imageData.source || state.currentSourceFolder;
@@ -383,7 +661,10 @@ const LocalImageGalleryNode = {
                 modal.querySelector('.localimage-preview-backdrop').addEventListener('click', closeModal);
                 modal.querySelector('.localimage-preview-close').addEventListener('click', closeModal);
             };
-            
+
+            // ================================================================
+            // DELETE
+            // ================================================================
             const deleteImage = async (imageData) => {
                 const imageName = imageData.originalName || imageData.name;
                 const imageSource = imageData.source || state.currentSourceFolder;
@@ -398,12 +679,9 @@ const LocalImageGalleryNode = {
                     const result = await response.json();
                     
                     if (response.ok) {
-                        // Remove from multi-selection if it was selected
-                        const key = makeSelectionKey(imageName, imageSource);
-                        if (state.selectedImages.has(key)) {
-                            state.selectedImages.delete(key);
-                            updateSelection();
-                        }
+                        state.selectedImages.delete(imageName);
+                        state.selectedImageSources.delete(imageName);
+                        updateSelection();
                         
                         state.availableImages = state.availableImages.filter(
                             img => !(img.original_name === imageName && img.source === imageSource)
@@ -421,6 +699,57 @@ const LocalImageGalleryNode = {
                 }
             };
 
+            const deleteSelectedImages = async () => {
+                const names = Array.from(state.selectedImages);
+                if (names.length === 0) return;
+
+                if (!confirm(`Delete ${names.length} selected image(s)? This cannot be undone.`)) return;
+
+                let deletedCount = 0;
+                for (const name of names) {
+                    const source = state.selectedImageSources.get(name) || state.currentSourceFolder;
+                    try {
+                        const response = await api.fetchApi('/imagegallery/delete_image', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ image: name, source })
+                        });
+                        if (response.ok) {
+                            deletedCount++;
+                            state.selectedImages.delete(name);
+                            state.selectedImageSources.delete(name);
+                            state.availableImages = state.availableImages.filter(
+                                img => !(img.original_name === name && img.source === source)
+                            );
+                        }
+                    } catch (err) {
+                        console.error(`Error deleting ${name}:`, err);
+                    }
+                }
+
+                updateSelection();
+                state.visibleRange = { start: 0, end: 0 };
+                renderVisibleCards();
+            };
+
+            // ================================================================
+            // SELECT ALL VISIBLE
+            // ================================================================
+            const selectAllVisible = () => {
+                const filteredImages = getFilteredImages();
+                filteredImages.forEach(img => {
+                    const name = img.original_name || img.name;
+                    state.selectedImages.add(name);
+                    state.selectedImageSources.set(name, img.source || state.currentSourceFolder);
+                });
+                updateSelection();
+                state.visibleRange = { start: 0, end: 0 };
+                renderVisibleCards();
+            };
+
+            // ================================================================
+            // PASTE FROM CLIPBOARD
+            // ================================================================
             const pasteImageFromClipboard = async () => {
                 try {
                     if (!navigator.clipboard || !navigator.clipboard.read) {
@@ -463,28 +792,13 @@ const LocalImageGalleryNode = {
                         
                         if (response.ok && result.filename) {
                             await api.fetchApi("/imagegallery/invalidate_cache", { method: "POST" });
-                            state.currentFolder = "";
                             state.foldersRendered = false;
                             state.visibleRange = { start: 0, end: 0 };
                             await fetchAndRender(false, false);
                             await new Promise(resolve => setTimeout(resolve, 50));
                             
-                            const pastedImage = state.availableImages.find(img => 
-                                img.original_name === result.filename || img.name.includes(result.filename)
-                            );
-                            
-                            // Select the pasted image (replace selection)
-                            state.selectedImages.clear();
-                            state.selectedImages.set(
-                                makeSelectionKey(result.filename, pastedImage?.source || state.currentSourceFolder),
-                                {
-                                    name: result.filename,
-                                    source: pastedImage?.source || state.currentSourceFolder,
-                                    actual_source: pastedImage?.source || "",
-                                    width: 0,
-                                    height: 0
-                                }
-                            );
+                            state.selectedImages.add(result.filename);
+                            state.selectedImageSources.set(result.filename, state.currentSourceFolder);
                             updateSelection();
                             
                             setTimeout(() => {
@@ -509,12 +823,15 @@ const LocalImageGalleryNode = {
                 }
             };
 
-            // === API FUNCTIONS ===
-            const getImages = async (page = 1, search = "", metadataFilter = "all", sortOrder = "name", recursive = false, subfolder = "") => {
+            // ================================================================
+            // API
+            // ================================================================
+            const getImages = async (page = 1, search = "", metadataFilter = "all", sortOrder = "name", recursive = false) => {
                 state.isLoading = true;
                 try {
                     const sourceEncoded = encodeURIComponent(state.currentSourceFolder || '');
-                    const subfolderEncoded = encodeURIComponent(subfolder || '');
+                    const subfolderStr = getCurrentSubfolderStr();
+                    const subfolderEncoded = encodeURIComponent(subfolderStr);
                     const url = `/imagegallery/get_images?page=${page}&per_page=100&search=${encodeURIComponent(search)}&metadata=${encodeURIComponent(metadataFilter)}&sort=${encodeURIComponent(sortOrder)}&source=${sourceEncoded}&recursive=${recursive}&subfolder=${subfolderEncoded}`;
                     const response = await api.fetchApi(url);
                     const data = await response.json();
@@ -527,62 +844,6 @@ const LocalImageGalleryNode = {
                 } finally {
                     state.isLoading = false;
                 }
-            };
-
-            // ===== CORE: updateSelection for multi-select =====
-            const updateSelection = () => {
-                const count = state.selectedImages.size;
-
-                // Update hidden widget values
-                const jsonVal = serializeSelectedImages();
-                node.setProperty("selected_images_json", jsonVal);
-                const jsonWidget = node.widgets.find(w => w.name === "selected_images_json");
-                if (jsonWidget) jsonWidget.value = jsonVal;
-
-                // Legacy single-select compat: expose first item
-                const firstItem = count > 0 ? Array.from(state.selectedImages.values())[0] : null;
-                node.setProperty("selected_image", firstItem ? firstItem.name : "");
-                node.setProperty("source_folder", firstItem ? (firstItem.source || "") : "");
-                node.setProperty("actual_source", firstItem ? (firstItem.actual_source || "") : "");
-
-                const legacyWidget = node.widgets.find(w => w.name === "selected_image");
-                if (legacyWidget) legacyWidget.value = firstItem ? firstItem.name : "";
-                const srcWidget = node.widgets.find(w => w.name === "source_folder");
-                if (srcWidget) srcWidget.value = firstItem ? (firstItem.source || "") : "";
-
-                // Update display text
-                let displayName = "None";
-                if (count === 1) {
-                    displayName = firstItem.name;
-                    if (firstItem.width && firstItem.height) {
-                        displayName += ` (${firstItem.width} × ${firstItem.height})`;
-                    }
-                } else if (count > 1) {
-                    displayName = `${count} images selected`;
-                }
-                els.selectedName.textContent = displayName;
-                els.selectedName.title = displayName;
-
-                // Show/hide clear button
-                els.clearSelectionBtn.style.display = count > 0 ? "inline-block" : "none";
-
-                // Update card highlight states in the DOM
-                els.viewport.querySelectorAll('.localimage-image-card').forEach(card => {
-                    const cardOriginalName = card.dataset.originalName;
-                    const cardSource = card.dataset.imageSource || "";
-                    const selected = isImageSelected(cardOriginalName, cardSource);
-                    card.classList.toggle('selected', selected);
-                });
-
-                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
-                    selected_images_json: jsonVal,
-                    current_source_folder: state.currentSourceFolder,
-                    metadata_filter: state.metadataFilter,
-                    sort_order: state.sortOrder,
-                    preview_size: state.previewSize,
-                    preview_mode: state.previewMode,
-                    auto_hide_preview: state.autoHidePreview
-                });
             };
 
             const loadSourceFolders = async () => {
@@ -619,53 +880,6 @@ const LocalImageGalleryNode = {
                 } else if (state.availableSourceFolders.length > 0) {
                     els.sourceSelect.value = state.availableSourceFolders[0].path;
                     state.currentSourceFolder = state.availableSourceFolders[0].path;
-                }
-            };
-
-            const loadSubfolders = async () => {
-                const sourceFolder = state.currentSourceFolder;
-                if (!sourceFolder || sourceFolder === '__ALL__') {
-                    state.availableSubfolders = [];
-                    renderSubfolders();
-                    return;
-                }
-                
-                try {
-                    const sourceEncoded = encodeURIComponent(sourceFolder);
-                    const response = await api.fetchApi(`/imagegallery/get_subfolders?source=${sourceEncoded}`);
-                    const data = await response.json();
-                    state.availableSubfolders = data.subfolders || [];
-                    renderSubfolders();
-                } catch (error) {
-                    console.error("Failed to load subfolders:", error);
-                    state.availableSubfolders = [];
-                    renderSubfolders();
-                }
-            };
-
-            const renderSubfolders = () => {
-                const currentVal = state.currentSubfolder;
-                els.subfolderSelect.innerHTML = '';
-                
-                els.subfolderSelect.disabled = !state.currentSourceFolder || state.currentSourceFolder === '__ALL__';
-                
-                const allOption = document.createElement('option');
-                allOption.value = '';
-                allOption.textContent = 'All Subfolders';
-                allOption.title = 'Show images from all subfolders';
-                els.subfolderSelect.appendChild(allOption);
-                
-                state.availableSubfolders.forEach((folder) => {
-                    const option = document.createElement('option');
-                    option.value = folder;
-                    option.textContent = folder.replace(/\\/g, '/');
-                    els.subfolderSelect.appendChild(option);
-                });
-                
-                if (currentVal && state.availableSubfolders.includes(currentVal)) {
-                    els.subfolderSelect.value = currentVal;
-                } else {
-                    state.currentSubfolder = "";
                 }
             };
 
@@ -710,6 +924,9 @@ const LocalImageGalleryNode = {
                 );
             };
 
+            // ================================================================
+            // RENDER CARDS  (virtualised)
+            // ================================================================
             const renderVisibleCards = () => {
                 const filteredImages = getFilteredImages();
                 const totalImages = filteredImages.length;
@@ -758,18 +975,17 @@ const LocalImageGalleryNode = {
                     const card = document.createElement("div");
                     card.className = "localimage-image-card";
                     
-                    const imgOriginalName = img.original_name || img.name;
-                    const imgSource = img.source || "";
-                    const selected = isImageSelected(imgOriginalName, imgSource);
-                    if (selected) card.classList.add("selected");
+                    const originalName = img.original_name || img.name;
+                    const isSelected = state.selectedImages.has(originalName);
+                    if (isSelected) card.classList.add("selected");
                     
                     card.dataset.imageName = img.name;
-                    card.dataset.originalName = imgOriginalName;
-                    card.dataset.imageSource = imgSource;
+                    card.dataset.originalName = originalName;
+                    card.dataset.imageSource = img.source || "";
                     card.dataset.imageWidth = img.width || 0;
                     card.dataset.imageHeight = img.height || 0;
                     card.dataset.index = i;
-                    card.title = img.name;
+                    card.title = img.name + "\n\n• Click – select/deselect\n• Ctrl+Click – add/remove from selection\n• Shift+Click – range select\n• Alt+Click / Dbl-click – preview";
                     card.style.height = `${state.cardHeight}px`;
 
                     const displayName = img.name.includes('/') || img.name.includes('\\') 
@@ -782,20 +998,9 @@ const LocalImageGalleryNode = {
                     
                     const objectFit = state.previewMode === "full" ? "contain" : "cover";
 
-                    // Badge showing selection order (when multiple selected)
-                    let selectionBadge = "";
-                    if (selected && state.selectedImages.size > 1) {
-                        const keys = Array.from(state.selectedImages.keys());
-                        const orderIdx = keys.indexOf(makeSelectionKey(imgOriginalName, imgSource));
-                        if (orderIdx >= 0) {
-                            selectionBadge = `<div class="localimage-selection-badge">${orderIdx + 1}</div>`;
-                        }
-                    }
-
                     card.innerHTML = `
                         <div class="localimage-media-container" style="height: ${imageHeight}px;">
                             <img src="${imageUrl}" loading="lazy" decoding="async" alt="${displayName}" style="object-fit: ${objectFit};">
-                            ${selectionBadge}
                         </div>
                         <div class="localimage-image-card-info">
                             <p>${displayName}</p>
@@ -821,122 +1026,90 @@ const LocalImageGalleryNode = {
                 els.viewport.appendChild(fragment);
             };
 
-            // ===== MULTI-SELECT CLICK HANDLER =====
-            // - Plain click: toggle single item, clear others
-            // - Ctrl/Cmd+click: toggle item into/out of selection (additive)
-            // - Shift+click: range select from lastClickedIndex to current
-            // - Double-click: preview
+            // ================================================================
+            // CLICK HANDLING  (multi-select logic)
+            // ================================================================
             els.viewport.addEventListener("click", (e) => {
                 const card = e.target.closest(".localimage-image-card");
                 if (!card) return;
-                
-                // Ctrl+click: preview (legacy behaviour kept intentionally via Ctrl)
-                // Changing to: Ctrl/Meta = additive toggle, Shift = range select
-                const originalName = card.dataset.originalName || card.dataset.imageName;
-                const imageSource = card.dataset.imageSource || "";
+
                 const imageName = card.dataset.imageName;
-                const imageWidth = parseInt(card.dataset.imageWidth) || 0;
-                const imageHeight = parseInt(card.dataset.imageHeight) || 0;
-                const clickedIndex = parseInt(card.dataset.index);
+                const imageSource = card.dataset.imageSource || "";
+                const originalName = card.dataset.originalName || imageName;
+                const clickedIndex = parseInt(card.dataset.index, 10);
 
-                const key = makeSelectionKey(originalName, imageSource);
-                const filteredImages = getFilteredImages();
-
-                if (e.shiftKey && state.lastClickedIndex >= 0) {
-                    // --- Shift+click: range select ---
-                    const start = Math.min(state.lastClickedIndex, clickedIndex);
-                    const end = Math.max(state.lastClickedIndex, clickedIndex);
-                    
-                    // Add all images in range to selection (keep existing selection too)
-                    for (let i = start; i <= end; i++) {
-                        const img = filteredImages[i];
-                        if (!img) continue;
-                        const imgOriginalName = img.original_name || img.name;
-                        const imgSource = img.source || "";
-                        const rangeKey = makeSelectionKey(imgOriginalName, imgSource);
-                        if (!state.selectedImages.has(rangeKey)) {
-                            state.selectedImages.set(rangeKey, {
-                                name: imgOriginalName,
-                                source: imgSource,
-                                actual_source: imgSource,
-                                width: img.width || 0,
-                                height: img.height || 0
-                            });
-                        }
-                    }
-                    // Don't update lastClickedIndex on shift-click
-                } else if (e.ctrlKey || e.metaKey) {
-                    // --- Ctrl/Meta+click: additive toggle ---
-                    if (state.selectedImages.has(key)) {
-                        state.selectedImages.delete(key);
-                    } else {
-                        state.selectedImages.set(key, {
-                            name: originalName,
-                            source: imageSource,
-                            actual_source: imageSource,
-                            width: imageWidth,
-                            height: imageHeight
-                        });
-                    }
-                    state.lastClickedIndex = clickedIndex;
-                } else {
-                    // --- Plain click: exclusive select (toggle off if only this one selected) ---
-                    if (state.selectedImages.size === 1 && state.selectedImages.has(key)) {
-                        // Clicking the only selected item deselects it
-                        state.selectedImages.clear();
-                    } else {
-                        state.selectedImages.clear();
-                        state.selectedImages.set(key, {
-                            name: originalName,
-                            source: imageSource,
-                            actual_source: imageSource,
-                            width: imageWidth,
-                            height: imageHeight
-                        });
-                    }
-                    state.lastClickedIndex = clickedIndex;
+                if (e.altKey) {
+                    showPreviewModal({ name: imageName, originalName, source: imageSource });
+                    return;
                 }
-                
+
+                if (e.shiftKey) {
+                    e.preventDefault();
+                    if (state.lastClickedIndex >= 0) {
+                        selectRange(state.lastClickedIndex, clickedIndex);
+                    } else {
+                        state.selectedImages.add(originalName);
+                        state.selectedImageSources.set(originalName, imageSource);
+                    }
+                    state.lastClickedIndex = clickedIndex;
+                    updateSelection();
+                    return;
+                }
+
+                if (e.ctrlKey || e.metaKey) {
+                    toggleImageSelection(originalName, imageSource);
+                    state.lastClickedIndex = clickedIndex;
+                    updateSelection();
+                    return;
+                }
+
+                const alreadySoleSelection =
+                    state.selectedImages.size === 1 && state.selectedImages.has(originalName);
+
+                state.selectedImages.clear();
+                state.selectedImageSources.clear();
+
+                if (!alreadySoleSelection) {
+                    state.selectedImages.add(originalName);
+                    state.selectedImageSources.set(originalName, imageSource);
+                }
+
+                state.lastClickedIndex = clickedIndex;
                 updateSelection();
             });
 
-            // DOUBLE-CLICK TO PREVIEW
             els.viewport.addEventListener("dblclick", (e) => {
                 const card = e.target.closest(".localimage-image-card");
                 if (!card) return;
-                
-                const imageData = {
+                showPreviewModal({
                     name: card.dataset.imageName,
                     originalName: card.dataset.originalName || card.dataset.imageName,
                     source: card.dataset.imageSource || state.currentSourceFolder
-                };
-                
-                showPreviewModal(imageData);
+                });
             });
 
-            // RIGHT-CLICK CONTEXT MENU
             els.viewport.addEventListener("contextmenu", (e) => {
                 const card = e.target.closest(".localimage-image-card");
                 if (!card) return;
-                
-                const imageData = {
+                showContextMenu(e, {
                     name: card.dataset.imageName,
                     originalName: card.dataset.originalName || card.dataset.imageName,
                     source: card.dataset.imageSource || state.currentSourceFolder
-                };
-                
-                showContextMenu(e, imageData);
+                });
             });
 
-            // Clear selection button
             els.clearSelectionBtn.addEventListener("click", () => {
                 state.selectedImages.clear();
+                state.selectedImageSources.clear();
                 state.lastClickedIndex = -1;
                 updateSelection();
                 state.visibleRange = { start: 0, end: 0 };
                 renderVisibleCards();
             });
 
+            // ================================================================
+            // FETCH & RENDER
+            // ================================================================
             const fetchAndRender = async (append = false, invalidateCache = false) => {
                 if (state.isLoading) return;
                 
@@ -959,8 +1132,7 @@ const LocalImageGalleryNode = {
                     els.searchInput.value, 
                     state.metadataFilter, 
                     state.sortOrder,
-                    state.recursive,
-                    state.currentSubfolder
+                    state.recursive
                 );
 
                 if (append) {
@@ -976,6 +1148,9 @@ const LocalImageGalleryNode = {
                 if (!append) cacheHeights();
             };
 
+            // ================================================================
+            // UPLOAD
+            // ================================================================
             const uploadImage = async (file) => {
                 const formData = new FormData();
                 formData.append('image', file);
@@ -990,13 +1165,10 @@ const LocalImageGalleryNode = {
                     if (response.ok) {
                         const result = await response.json();
                         let uploadedName = result.name;
-                        if (result.subfolder) {
-                            uploadedName = `${result.subfolder}/${result.name}`;
-                        }
+                        if (result.subfolder) uploadedName = `${result.subfolder}/${result.name}`;
                         return uploadedName;
                     } else {
-                        const errorText = await response.text();
-                        console.error("Upload failed:", errorText);
+                        console.error("Upload failed:", await response.text());
                         return null;
                     }
                 } catch (error) {
@@ -1013,53 +1185,31 @@ const LocalImageGalleryNode = {
                 els.loadImageBtn.textContent = "⏳ Uploading...";
                 els.loadImageBtn.disabled = true;
                 
-                let uploadedNames = [];
+                const uploadedNames = [];
                 
                 try {
                     for (const file of files) {
-                        if (!file.type.startsWith('image/')) {
-                            console.warn(`Skipping non-image file: ${file.name}`);
-                            continue;
-                        }
-                        
+                        if (!file.type.startsWith('image/')) continue;
                         const uploadedName = await uploadImage(file);
-                        if (uploadedName) {
-                            uploadedNames.push(uploadedName);
-                        }
+                        if (uploadedName) uploadedNames.push(uploadedName);
                     }
                     
                     if (uploadedNames.length > 0) {
                         await api.fetchApi("/imagegallery/invalidate_cache", { method: "POST" });
-                        state.currentFolder = "";
                         state.foldersRendered = false;
                         state.visibleRange = { start: 0, end: 0 };
                         await fetchAndRender(false, false);
                         await new Promise(resolve => setTimeout(resolve, 50));
                         
-                        // Select all uploaded images
-                        state.selectedImages.clear();
-                        for (const uploadedName of uploadedNames) {
-                            const foundImg = state.availableImages.find(img =>
-                                img.original_name === uploadedName || img.name.includes(uploadedName)
-                            );
-                            const imgSource = foundImg?.source || state.currentSourceFolder;
-                            state.selectedImages.set(
-                                makeSelectionKey(uploadedName, imgSource),
-                                {
-                                    name: uploadedName,
-                                    source: imgSource,
-                                    actual_source: imgSource,
-                                    width: foundImg?.width || 0,
-                                    height: foundImg?.height || 0
-                                }
-                            );
-                        }
+                        uploadedNames.forEach(name => {
+                            state.selectedImages.add(name);
+                            state.selectedImageSources.set(name, state.currentSourceFolder);
+                        });
                         updateSelection();
                         
-                        // Scroll to first uploaded image
                         setTimeout(() => {
-                            const selectedCard = els.viewport.querySelector(`.localimage-image-card[data-image-name="${uploadedNames[0]}"]`);
-                            if (selectedCard) selectedCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            const card = els.viewport.querySelector(`.localimage-image-card[data-image-name="${uploadedNames[0]}"]`);
+                            if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         }, 150);
                     }
                 } catch (error) {
@@ -1071,10 +1221,11 @@ const LocalImageGalleryNode = {
                 }
             });
 
-            els.loadImageBtn.addEventListener("click", () => {
-                els.fileInput.click();
-            });
+            els.loadImageBtn.addEventListener("click", () => els.fileInput.click());
 
+            // ================================================================
+            // PASTE via keyboard (Ctrl+V inside container)
+            // ================================================================
             const handlePaste = async (e) => {
                 const items = e.clipboardData?.items;
                 if (!items) return;
@@ -1111,32 +1262,18 @@ const LocalImageGalleryNode = {
                     
                     if (response.ok && result.filename) {
                         await api.fetchApi("/imagegallery/invalidate_cache", { method: "POST" });
-                        state.currentFolder = "";
                         state.foldersRendered = false;
                         state.visibleRange = { start: 0, end: 0 };
                         await fetchAndRender(false, false);
                         await new Promise(resolve => setTimeout(resolve, 50));
                         
-                        const pastedImage = state.availableImages.find(img => 
-                            img.original_name === result.filename || img.name.includes(result.filename)
-                        );
-                        
-                        state.selectedImages.clear();
-                        state.selectedImages.set(
-                            makeSelectionKey(result.filename, pastedImage?.source || state.currentSourceFolder),
-                            {
-                                name: result.filename,
-                                source: pastedImage?.source || state.currentSourceFolder,
-                                actual_source: pastedImage?.source || "",
-                                width: 0,
-                                height: 0
-                            }
-                        );
+                        state.selectedImages.add(result.filename);
+                        state.selectedImageSources.set(result.filename, state.currentSourceFolder);
                         updateSelection();
                         
                         setTimeout(() => {
-                            const selectedCard = els.viewport.querySelector(`.localimage-image-card[data-original-name="${result.filename}"]`);
-                            if (selectedCard) selectedCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            const card = els.viewport.querySelector(`.localimage-image-card[data-original-name="${result.filename}"]`);
+                            if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         }, 150);
                     } else {
                         console.error('Paste failed:', result.error || 'Unknown error');
@@ -1152,21 +1289,34 @@ const LocalImageGalleryNode = {
             els.container.addEventListener('paste', handlePaste, true);
             els.container.setAttribute('tabindex', '0');
             els.container.style.outline = 'none';
+            els.container.addEventListener('mousedown', () => els.container.focus());
 
-            els.container.addEventListener('mousedown', () => { els.container.focus(); });
+            els.container.addEventListener('keydown', (e) => {
+                if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+                    e.preventDefault();
+                    selectAllVisible();
+                }
+                if (e.key === 'Escape') {
+                    state.selectedImages.clear();
+                    state.selectedImageSources.clear();
+                    state.lastClickedIndex = -1;
+                    updateSelection();
+                    state.visibleRange = { start: 0, end: 0 };
+                    renderVisibleCards();
+                }
+            });
 
             els.container.addEventListener('mouseenter', () => {
-                if (state.autoHidePreview && els.viewport) {
-                    els.viewport.classList.add('show-previews');
-                }
+                if (state.autoHidePreview && els.viewport) els.viewport.classList.add('show-previews');
             });
 
             els.container.addEventListener('mouseleave', () => {
-                if (state.autoHidePreview && els.viewport) {
-                    els.viewport.classList.remove('show-previews');
-                }
+                if (state.autoHidePreview && els.viewport) els.viewport.classList.remove('show-previews');
             });
 
+            // ================================================================
+            // SCROLL
+            // ================================================================
             let scrollRAF = null;
             let lastScrollTime = 0;
             const SCROLL_THROTTLE = 16;
@@ -1175,7 +1325,6 @@ const LocalImageGalleryNode = {
                 const now = performance.now();
                 if (now - lastScrollTime < SCROLL_THROTTLE) return;
                 lastScrollTime = now;
-                
                 if (scrollRAF) return;
                 
                 scrollRAF = requestAnimationFrame(() => {
@@ -1191,6 +1340,9 @@ const LocalImageGalleryNode = {
                 });
             }, { passive: true });
 
+            // ================================================================
+            // CONTROL EVENT LISTENERS
+            // ================================================================
             els.refreshBtn.addEventListener("click", () => {
                 state.foldersRendered = false;
                 fetchAndRender(false, true);
@@ -1199,18 +1351,14 @@ const LocalImageGalleryNode = {
             els.metadataSelect.addEventListener("change", () => {
                 state.metadataFilter = els.metadataSelect.value;
                 node.setProperty("metadata_filter", state.metadataFilter);
-                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
-                    metadata_filter: state.metadataFilter 
-                });
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { metadata_filter: state.metadataFilter });
                 fetchAndRender(false);
             });
 
             els.sortSelect.addEventListener("change", () => {
                 state.sortOrder = els.sortSelect.value;
                 node.setProperty("sort_order", state.sortOrder);
-                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
-                    sort_order: state.sortOrder 
-                });
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { sort_order: state.sortOrder });
                 fetchAndRender(false);
             });
 
@@ -1222,9 +1370,7 @@ const LocalImageGalleryNode = {
                 clearTimeout(sizeSliderTimeout);
                 sizeSliderTimeout = setTimeout(() => {
                     node.setProperty("preview_size", state.previewSize);
-                    LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
-                        preview_size: state.previewSize 
-                    });
+                    LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { preview_size: state.previewSize });
                 }, 500);
             });
 
@@ -1245,15 +1391,12 @@ const LocalImageGalleryNode = {
                 }
             });
 
-            els.sourceSelect.addEventListener("change", () => {
+            els.sourceSelect.addEventListener("change", async () => {
                 state.currentSourceFolder = els.sourceSelect.value;
-                state.currentSubfolder = "";
-                loadSubfolders();
-                fetchAndRender(false);
-            });
-
-            els.subfolderSelect.addEventListener("change", () => {
-                state.currentSubfolder = els.subfolderSelect.value;
+                // Reset subfolder path when source changes
+                state.subfolderPath = [];
+                state.subfolderLevels = [];
+                await initSubfolderNav([]);
                 fetchAndRender(false);
             });
 
@@ -1269,11 +1412,7 @@ const LocalImageGalleryNode = {
                 state.previewMode = state.previewMode === "thumbnail" ? "full" : "thumbnail";
                 els.previewModeToggle.textContent = state.previewMode === "full" ? "🖼️" : "🔍";
                 els.previewModeToggle.title = state.previewMode === "full" ? "Show thumbnail previews" : "Show full image previews";
-                
-                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
-                    preview_mode: state.previewMode 
-                });
-                
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { preview_mode: state.previewMode });
                 state.visibleRange = { start: 0, end: 0 };
                 renderVisibleCards();
             });
@@ -1282,11 +1421,7 @@ const LocalImageGalleryNode = {
                 state.autoHidePreview = !state.autoHidePreview;
                 els.autoHideToggle.textContent = state.autoHidePreview ? "🫥" : "👁️";
                 els.autoHideToggle.title = state.autoHidePreview ? "Auto-hide: Previews hidden until hover" : "Always show previews";
-                
-                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
-                    auto_hide_preview: state.autoHidePreview 
-                });
-                
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { auto_hide_preview: state.autoHidePreview });
                 updatePreviewVisibility();
             });
 
@@ -1294,15 +1429,13 @@ const LocalImageGalleryNode = {
                 state.recursive = !state.recursive;
                 els.recursiveToggle.textContent = state.recursive ? "🔁" : "📂";
                 els.recursiveToggle.title = state.recursive ? "Exclude subfolders" : "Include subfolders";
-                
-                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
-                    recursive: state.recursive 
-                });
-                
-                loadSubfolders();
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { recursive: state.recursive });
                 fetchAndRender(false, true);
             });
 
+            // ================================================================
+            // RESIZE
+            // ================================================================
             let resizeRAF = null;
             
             const fitHeight = () => {
@@ -1312,7 +1445,7 @@ const LocalImageGalleryNode = {
                 let topOffset = els.container.offsetTop;
                 if (topOffset < 20) topOffset = 65;
 
-                const bottomPadding = 32; 
+                const bottomPadding = 32;
                 const targetHeight = Math.max(0, node.size[1] - topOffset - bottomPadding);
                 
                 els.container.style.height = `${targetHeight}px`;
@@ -1325,26 +1458,24 @@ const LocalImageGalleryNode = {
 
             this.onResize = function(size) {
                 let minHeight = state.cachedHeights.selectedDisplay + state.cachedHeights.controls + HEADER_HEIGHT + MIN_GALLERY_HEIGHT;
-                
                 if (size[1] < minHeight) size[1] = minHeight;
                 if (size[0] < MIN_NODE_WIDTH) size[0] = MIN_NODE_WIDTH;
-
-                if (!resizeRAF) {
-                    resizeRAF = requestAnimationFrame(fitHeight);
-                }
+                if (!resizeRAF) resizeRAF = requestAnimationFrame(fitHeight);
             };
 
+            // ================================================================
+            // INITIALIZE
+            // ================================================================
             this.initializeNode = async () => {    
-                const existingSelectedImage = node.properties?.selected_image || "";
+                const existingSelectedImages = node.properties?.selected_images || "[]";
                 const existingSourceFolder = node.properties?.source_folder || "";
                 const existingActualSource = node.properties?.actual_source || "";
-                const existingSelectedImagesJson = node.properties?.selected_images_json || "[]";
                 
                 let initialState = { 
-                    selected_images_json: "[]",
-                    selected_image: "", 
+                    selected_images: "[]",
                     current_folder: "", 
                     current_source_folder: "",
+                    subfolder_path: [],
                     metadata_filter: "all", 
                     sort_order: "name", 
                     recursive: false,
@@ -1364,56 +1495,57 @@ const LocalImageGalleryNode = {
 
                 await loadSourceFolders();
 
+                let restoredNames = [];
+                try {
+                    const raw = existingSelectedImages !== "[]" ? existingSelectedImages : initialState.selected_images;
+                    restoredNames = JSON.parse(raw || "[]");
+                    if (!Array.isArray(restoredNames)) restoredNames = [];
+                } catch(e) { restoredNames = []; }
+
+                state.selectedImages = new Set(restoredNames);
+                restoredNames.forEach(name => {
+                    state.selectedImageSources.set(name, existingActualSource || existingSourceFolder || "");
+                });
+
                 state.currentSourceFolder = existingSourceFolder || initialState.current_source_folder || 
                     (state.availableSourceFolders.length > 0 ? state.availableSourceFolders[0].path : "");
                 
-                await loadSubfolders();
+                // Restore subfolder path
+                const savedSubfolderPath = initialState.subfolder_path || [];
+                await initSubfolderNav(Array.isArray(savedSubfolderPath) ? savedSubfolderPath : []);
 
                 state.metadataFilter = node.properties.metadata_filter || initialState.metadata_filter || "all";
                 state.sortOrder = node.properties.sort_order || initialState.sort_order || "name";
 
                 const propSize = node.properties.preview_size ? parseInt(node.properties.preview_size) : null;
                 state.previewSize = propSize || initialState.preview_size || 110;
+                
                 state.previewMode = node.properties.preview_mode || initialState.preview_mode || "thumbnail";
                 state.autoHidePreview = initialState.auto_hide_preview !== undefined ? initialState.auto_hide_preview : true;
                 state.recursive = initialState.recursive || false;
                 
-                if (state.currentSourceFolder) {
-                    els.sourceSelect.value = state.currentSourceFolder;
-                }
+                if (state.currentSourceFolder) els.sourceSelect.value = state.currentSourceFolder;
                 
-                // Restore multi-selection from saved state
-                // Priority: node property > server state
-                const savedJsonRaw = existingSelectedImagesJson !== "[]" 
-                    ? existingSelectedImagesJson 
-                    : (initialState.selected_images_json || "[]");
+                node.setProperty("selected_images", JSON.stringify(restoredNames));
+                node.setProperty("source_folder", state.currentSourceFolder); 
+                node.setProperty("actual_source", existingActualSource);
+                
+                const widget = node.widgets.find(w => w.name === "selected_images");
+                if (widget) widget.value = JSON.stringify(restoredNames);
+                
+                const sourceWidget = node.widgets.find(w => w.name === "source_folder"); 
+                if (sourceWidget) sourceWidget.value = state.currentSourceFolder;
 
-                let savedSelected = [];
-                try {
-                    savedSelected = JSON.parse(savedJsonRaw);
-                } catch(e) { savedSelected = []; }
-
-                // Backward compat: if no JSON but has legacy single image
-                if ((!savedSelected || savedSelected.length === 0) && existingSelectedImage) {
-                    savedSelected = [{
-                        name: existingSelectedImage,
-                        source: existingSourceFolder,
-                        actual_source: existingActualSource
-                    }];
-                }
-
-                state.selectedImages.clear();
-                for (const item of savedSelected) {
-                    if (item.name) {
-                        const key = makeSelectionKey(item.name, item.source || "");
-                        state.selectedImages.set(key, {
-                            name: item.name,
-                            source: item.source || "",
-                            actual_source: item.actual_source || item.source || "",
-                            width: 0,
-                            height: 0
-                        });
-                    }
+                const count = state.selectedImages.size;
+                if (count === 0) {
+                    els.selectedName.textContent = "None";
+                    els.selectedCount.style.display = "none";
+                } else if (count === 1) {
+                    els.selectedName.textContent = restoredNames[0];
+                } else {
+                    els.selectedName.textContent = `${count} images selected`;
+                    els.selectedCount.textContent = `×${count}`;
+                    els.selectedCount.style.display = "inline-block";
                 }
                 
                 els.sizeSlider.value = state.previewSize;
@@ -1431,29 +1563,11 @@ const LocalImageGalleryNode = {
 
                 await fetchAndRender();
 
-                // Update resolution info for selected images
                 if (state.selectedImages.size > 0) {
                     const filteredImages = getFilteredImages();
-                    for (const [key, item] of state.selectedImages) {
-                        const found = filteredImages.find(img =>
-                            (img.original_name === item.name || img.name === item.name)
-                        );
-                        if (found) {
-                            item.width = found.width || 0;
-                            item.height = found.height || 0;
-                        }
-                    }
-                }
-
-                // Update UI (display text, clear btn, card highlights)
-                updateSelection();
-
-                // Scroll to first selected image
-                if (state.selectedImages.size > 0) {
-                    const firstItem = Array.from(state.selectedImages.values())[0];
-                    const filteredImages = getFilteredImages();
-                    const selectedIndex = filteredImages.findIndex(img =>
-                        img.original_name === firstItem.name || img.name === firstItem.name
+                    const firstName = Array.from(state.selectedImages)[0];
+                    const selectedIndex = filteredImages.findIndex(img => 
+                        (img.original_name || img.name) === firstName
                     );
                     
                     if (selectedIndex >= 0) {
@@ -1472,8 +1586,9 @@ const LocalImageGalleryNode = {
                 
                 if (state.metadataFilter) els.metadataSelect.value = state.metadataFilter;
                 if (state.sortOrder) els.sortSelect.value = state.sortOrder;
-            };
 
+                if (state.selectedImages.size > 0) els.clearSelectionBtn.style.display = "inline-flex";
+            };
 
             const originalOnRemoved = this.onRemoved;
             this.onRemoved = function() {
@@ -1482,15 +1597,13 @@ const LocalImageGalleryNode = {
                 clearTimeout(searchTimeout);
                 clearTimeout(sizeSliderTimeout);
                 
-                if (els.container) {
-                    els.container.removeEventListener('paste', handlePaste, true);
-                }
-                
+                if (els.container) els.container.removeEventListener('paste', handlePaste, true);
                 LocalImageGalleryNode.closeContextMenu();
                 
                 state.elements = {};
                 state.availableImages = [];
                 state.selectedImages.clear();
+                state.selectedImageSources.clear();
                 
                 if (originalOnRemoved) originalOnRemoved.apply(this, arguments);
             };
@@ -1503,7 +1616,9 @@ const LocalImageGalleryNode = {
             return result;
         };
 
-        // Global styles
+        // ================================================================
+        // GLOBAL STYLES
+        // ================================================================
         nodeType.prototype._ensureGlobalStyles = function() {
             if (document.getElementById('localimage-gallery-styles')) return;
             
@@ -1518,7 +1633,7 @@ const LocalImageGalleryNode = {
                     border: 1px solid #444;
                     border-radius: 6px;
                     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
-                    min-width: 160px;
+                    min-width: 180px;
                     padding: 4px 0;
                     font-family: sans-serif;
                     font-size: 14px;
@@ -1532,157 +1647,75 @@ const LocalImageGalleryNode = {
                     color: #ddd;
                     transition: background 0.15s;
                 }
-                .localimage-context-menu-item:hover {
-                    background: #3a3a3a;
-                }
-                .localimage-context-menu-item.delete-item:hover {
-                    background: #5a2a2a;
-                    color: #ff6b6b;
-                }
-                .localimage-context-menu-item .icon {
-                    font-size: 16px;
-                    width: 20px;
-                    text-align: center;
-                }
-                .localimage-context-menu-item .label {
-                    flex-grow: 1;
-                }
-                .localimage-context-menu-separator {
-                    height: 1px;
-                    background: #444;
-                    margin: 4px 8px;
-                }
+                .localimage-context-menu-item:hover { background: #3a3a3a; }
+                .localimage-context-menu-item.delete-item:hover { background: #5a2a2a; color: #ff6b6b; }
+                .localimage-context-menu-item .icon { font-size: 16px; width: 20px; text-align: center; }
+                .localimage-context-menu-item .label { flex-grow: 1; }
+                .localimage-context-menu-separator { height: 1px; background: #444; margin: 4px 8px; }
                 
                 /* Preview Modal Styles */
                 .localimage-preview-modal {
-                    position: fixed;
-                    z-index: 1000000;
-                    inset: 0;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
+                    position: fixed; z-index: 1000000; inset: 0;
+                    display: flex; align-items: center; justify-content: center;
                 }
                 .localimage-preview-backdrop {
-                    position: absolute;
-                    inset: 0;
-                    background: rgba(0, 0, 0, 0.85);
-                    cursor: pointer;
+                    position: absolute; inset: 0;
+                    background: rgba(0, 0, 0, 0.85); cursor: pointer;
                 }
                 .localimage-preview-content {
-                    position: relative;
-                    max-width: 90vw;
-                    max-height: 90vh;
-                    display: flex;
-                    flex-direction: column;
-                    background: #1e1e1e;
-                    border-radius: 8px;
-                    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
-                    overflow: hidden;
+                    position: relative; max-width: 90vw; max-height: 90vh;
+                    display: flex; flex-direction: column;
+                    background: #1e1e1e; border-radius: 8px;
+                    box-shadow: 0 8px 40px rgba(0,0,0,0.6); overflow: hidden;
                 }
                 .localimage-preview-header {
-                    display: flex;
-                    align-items: center;
-                    gap: 12px;
-                    padding: 12px 16px;
-                    background: #252525;
-                    border-bottom: 1px solid #3a3a3a;
-                    flex-shrink: 0;
+                    display: flex; align-items: center; gap: 12px;
+                    padding: 12px 16px; background: #252525;
+                    border-bottom: 1px solid #3a3a3a; flex-shrink: 0;
                 }
                 .localimage-preview-filename {
-                    flex-grow: 1;
-                    color: #00FFC9;
-                    font-weight: bold;
-                    font-size: 14px;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                    white-space: nowrap;
+                    flex-grow: 1; color: #00FFC9; font-weight: bold; font-size: 14px;
+                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
                 }
-                .localimage-preview-dimensions {
-                    color: #888;
-                    font-size: 13px;
-                }
+                .localimage-preview-dimensions { color: #888; font-size: 13px; }
                 .localimage-preview-close {
-                    background: none;
-                    border: none;
-                    color: #888;
-                    font-size: 24px;
-                    cursor: pointer;
-                    padding: 0 8px;
-                    line-height: 1;
-                    transition: color 0.2s;
+                    background: none; border: none; color: #888; font-size: 24px;
+                    cursor: pointer; padding: 0 8px; line-height: 1; transition: color 0.2s;
                 }
-                .localimage-preview-close:hover {
-                    color: #fff;
-                }
+                .localimage-preview-close:hover { color: #fff; }
                 .localimage-preview-image-container {
-                    flex: 1;
-                    overflow: auto;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    background: #111;
+                    flex: 1; overflow: auto; display: flex;
+                    align-items: center; justify-content: center; background: #111;
                 }
                 .localimage-preview-image-container img {
-                    max-width: 100%;
-                    max-height: calc(90vh - 60px);
-                    object-fit: contain;
+                    max-width: 100%; max-height: calc(90vh - 60px); object-fit: contain;
                 }
                 
-                /* Multi-select selection order badge */
-                .localimage-selection-badge {
-                    position: absolute;
-                    top: 4px;
-                    left: 4px;
-                    width: 22px;
-                    height: 22px;
-                    background: #00FFC9;
-                    color: #000;
-                    border-radius: 50%;
-                    font-size: 12px;
-                    font-weight: bold;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    z-index: 10;
-                    pointer-events: none;
-                    line-height: 1;
-                }
-
-                /* Clear selection button */
-                .localimage-root .clear-selection-btn {
-                    background: #5a3a2a;
-                    color: #ffaa88;
-                    border: 1px solid #7a5a4a;
-                    border-radius: 4px;
-                    padding: 3px 10px;
-                    font-size: 13px;
-                    cursor: pointer;
-                    flex-shrink: 0;
-                    margin-left: auto;
-                    transition: background 0.2s;
-                    white-space: nowrap;
-                }
-                .localimage-root .clear-selection-btn:hover {
-                    background: #7a4a3a;
-                    color: #ffcc99;
-                }
-                
-                /* Existing styles */
+                /* Folder manager btn */
                 .localimage-root .localimage-size-control .folder-manager-btn {
-                    background: #3a3a5a;
-                    color: #fff;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 6px 12px;
-                    cursor: pointer;
-                    font-size: 14px;
+                    background: #3a3a5a; color: #fff; border: none; border-radius: 4px;
+                    padding: 6px 12px; cursor: pointer; font-size: 14px; flex-shrink: 0;
+                    white-space: nowrap; transition: background 0.2s;
+                }
+                .localimage-root .localimage-size-control .folder-manager-btn:hover { background: #4a4a7a; }
+                
+                /* Clear selection button */
+                .localimage-root .localimage-size-control .clear-selection-btn {
+                    background: #5a3a1a; color: #ffaa44; border: none; border-radius: 4px;
+                    padding: 6px 10px; cursor: pointer; font-size: 13px; flex-shrink: 0;
+                    white-space: nowrap; transition: background 0.2s;
+                    display: inline-flex; align-items: center; gap: 4px;
+                }
+                .localimage-root .localimage-size-control .clear-selection-btn:hover { background: #7a4a1a; }
+
+                /* Selected count badge */
+                .localimage-root .localimage-selected-display .selected-count {
+                    background: #00FFC9; color: #000; border-radius: 10px;
+                    font-size: 12px; font-weight: bold; padding: 2px 8px;
                     flex-shrink: 0;
-                    white-space: nowrap;
-                    transition: background 0.2s;
                 }
-                .localimage-root .localimage-size-control .folder-manager-btn:hover {
-                    background: #4a4a7a;
-                }
+                
+                /* Main layout */
                 .localimage-root .localimage-container { 
                     display: flex; flex-direction: column; height: 100%; 
                     font-family: sans-serif; overflow: hidden; 
@@ -1696,9 +1729,8 @@ const LocalImageGalleryNode = {
                 }
                 .localimage-root .localimage-selected-display .label { font-size: 15px; color: #888; }
                 .localimage-root .localimage-selected-display .selected-name { 
-                    color: #00FFC9; font-weight: bold; font-size: 15px;
+                    color: #00FFC9; font-weight: bold; font-size: 15px; flex-grow: 1;
                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-                    flex: 1 1 0; min-width: 0;
                 }
                 .localimage-root .localimage-controls { 
                     display: flex; padding: 8px; gap: 8px; align-items: center; 
@@ -1711,15 +1743,9 @@ const LocalImageGalleryNode = {
                 }
                 .localimage-root .localimage-controls input[type=text]:focus { outline: none; border-color: #00FFC9; }
                 .localimage-root .localimage-controls select {
-                    background: #333;
-                    color: #ccc;
-                    border: 1px solid #555;
-                    padding: 12px 12px;
-                    border-radius: 4px;
-                    font-size: 15px;
-                    width: 200px;
-                    min-width: 200px;
-                    max-width: 200px;
+                    background: #333; color: #ccc; border: 1px solid #555;
+                    padding: 12px 12px; border-radius: 4px; font-size: 15px;
+                    width: 200px; min-width: 200px; max-width: 200px;
                 }
                 .localimage-root .localimage-controls button {
                     background: #444; color: #fff; border: none; border-radius: 4px;
@@ -1727,100 +1753,138 @@ const LocalImageGalleryNode = {
                 }
                 .localimage-root .localimage-controls button:hover { background: #555; }
                 
+                /* ---- Hierarchical subfolder navigation bar ---- */
+                .localimage-root .localimage-subfolder-nav {
+                    display: none;
+                    align-items: center;
+                    flex-wrap: wrap;
+                    gap: 4px;
+                    padding: 6px 8px;
+                    background: #1e2a22;
+                    border-bottom: 1px solid #2a4a35;
+                    flex-shrink: 0;
+                    min-height: 34px;
+                }
+                .localimage-root .localimage-subfolder-nav .subfolder-sep {
+                    color: #00FFC9;
+                    font-size: 16px;
+                    font-weight: bold;
+                    flex-shrink: 0;
+                    padding: 0 2px;
+                    user-select: none;
+                }
+                .localimage-root .localimage-subfolder-nav .subfolder-level-select {
+                    background: #253a2d;
+                    color: #cce8d5;
+                    border: 1px solid #3a6a4a;
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                    font-size: 13px;
+                    cursor: pointer;
+                    max-width: 180px;
+                    flex-shrink: 0;
+                    transition: border-color 0.2s, background 0.2s;
+                }
+                .localimage-root .localimage-subfolder-nav .subfolder-level-select:focus {
+                    outline: none;
+                    border-color: #00FFC9;
+                    background: #2a4a35;
+                }
+                .localimage-root .localimage-subfolder-nav .subfolder-level-select option {
+                    background: #1e2a22;
+                    color: #cce8d5;
+                }
+                /* ---- end subfolder nav ---- */
+
+                /* Size control */
                 .localimage-root .localimage-size-control {
                     display: flex; align-items: center; gap: 8px;
                     padding: 8px 10px; background-color: #252525;
-                    border-bottom: 1px solid #3a3a3a; flex-shrink: 0;
+                    border-bottom: 1px solid #3a3a3a; flex-shrink: 0; flex-wrap: wrap;
                 }
-                .localimage-root .localimage-size-control .size-label {
-                    flex-shrink: 0; line-height: 1;
-                }
-                .localimage-root .localimage-size-control .size-label-small {
-                    font-size: 15px;
-                }
-                .localimage-root .localimage-size-control .size-label-large {
-                    font-size: 20px;
-                }
+                .localimage-root .localimage-size-control .size-label { flex-shrink: 0; line-height: 1; }
+                .localimage-root .localimage-size-control .size-label-small { font-size: 15px; }
+                .localimage-root .localimage-size-control .size-label-large { font-size: 20px; }
                 .localimage-root .localimage-size-control .size-slider {
                     flex-grow: 1; height: 8px; -webkit-appearance: none; appearance: none;
                     background: #444; border-radius: 2px; outline: none; cursor: pointer;
                 }
                 .localimage-root .localimage-size-control .size-slider::-webkit-slider-thumb {
                     -webkit-appearance: none; appearance: none; width: 24px; height: 24px;
-                    background: #00A68C; border-radius: 50%; cursor: pointer;
-                    transition: background 0.2s;
+                    background: #00A68C; border-radius: 50%; cursor: pointer; transition: background 0.2s;
                 }
-                .localimage-root .localimage-size-control .size-slider::-webkit-slider-thumb:hover {
-                    background: #008C74;
-                }
+                .localimage-root .localimage-size-control .size-slider::-webkit-slider-thumb:hover { background: #008C74; }
                 .localimage-root .localimage-size-control .size-slider::-moz-range-thumb {
-                    width: 14px; height: 14px; background: #00FFC9; border-radius: 50%;
-                    cursor: pointer; border: none;
+                    width: 14px; height: 14px; background: #00FFC9; border-radius: 50%; cursor: pointer; border: none;
                 }
                 
+                /* Auto-hide */
                 .localimage-root .localimage-gallery-viewport.auto-hide-preview .localimage-media-container img {
-                    opacity: 0;
-                    transition: opacity 0.3s ease;
+                    opacity: 0; transition: opacity 0.3s ease;
                 }
                 .localimage-root .localimage-gallery-viewport.auto-hide-preview.show-previews .localimage-media-container img,
                 .localimage-root .localimage-gallery-viewport.auto-hide-preview:hover .localimage-media-container img {
                     opacity: 1;
                 }
-                .localimage-root .localimage-gallery-viewport.auto-hide-preview .localimage-image-card {
-                    transition: border-color 0.3s ease;
-                }
                 
-                .localimage-root .localimage-size-control .preview-mode-toggle {
+                /* Toggle buttons */
+                .localimage-root .localimage-size-control .preview-mode-toggle,
+                .localimage-root .localimage-size-control .auto-hide-toggle,
+                .localimage-root .localimage-size-control .recursive-toggle {
                     background: #444; color: #fff; border: none; border-radius: 4px;
                     padding: 6px 8px; cursor: pointer; font-size: 16px; flex-shrink: 0;
                     white-space: nowrap; transition: background 0.2s; margin-left: 4px;
                 }
-                .localimage-root .localimage-size-control .preview-mode-toggle:hover { background: #555; }
+                .localimage-root .localimage-size-control .preview-mode-toggle:hover,
+                .localimage-root .localimage-size-control .auto-hide-toggle:hover,
+                .localimage-root .localimage-size-control .recursive-toggle:hover { background: #555; }
                 
-                .localimage-root .localimage-size-control .auto-hide-toggle {
-                    background: #444; color: #fff; border: none; border-radius: 4px;
-                    padding: 6px 8px; cursor: pointer; font-size: 16px; flex-shrink: 0;
-                    white-space: nowrap; transition: background 0.2s; margin-left: 4px;
-                }
-                .localimage-root .localimage-size-control .auto-hide-toggle:hover { background: #555; }
-                
+                /* Gallery viewport */
                 .localimage-root .localimage-gallery { 
                     flex: 1 1 0; min-height: 0; overflow-y: auto; overflow-x: hidden; 
-                    background-color: #1a1a1a;
-                    contain: strict;
+                    background-color: #1a1a1a; contain: strict;
                 }
                 .localimage-root .localimage-gallery-viewport {
-                    padding: 8px; 
-                    display: grid; 
+                    padding: 8px; display: grid; 
                     grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); 
-                    gap: 8px; 
-                    align-content: start;
+                    gap: 8px; align-content: start;
                 }
-                .localimage-root .localimage-spacer {
-                    pointer-events: none;
-                }
+                .localimage-root .localimage-spacer { pointer-events: none; }
+                
+                /* Image card */
                 .localimage-root .localimage-image-card { 
                     cursor: pointer; border: 4px solid transparent; border-radius: 6px; 
                     background-color: #2a2a2a; display: flex; flex-direction: column; 
                     position: relative; overflow: hidden;
-                    contain: layout style paint;
-                    transition: border-color 0.2s;
+                    contain: layout style paint; transition: border-color 0.2s;
+                    user-select: none;
                 }
-                .localimage-root .localimage-image-card:hover { 
-                    border-color: #555;
-                }
+                .localimage-root .localimage-image-card:hover { border-color: #555; }
                 .localimage-root .localimage-image-card.selected { 
                     border-color: #00FFC9; box-shadow: 0 0 10px rgba(0, 255, 201, 0.3); 
                 }
+                .localimage-root .localimage-image-card.selected::after {
+                    content: '✓';
+                    position: absolute;
+                    top: 4px; right: 4px;
+                    width: 18px; height: 18px;
+                    background: #00FFC9;
+                    color: #000;
+                    border-radius: 50%;
+                    font-size: 11px;
+                    font-weight: bold;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    pointer-events: none;
+                    line-height: 18px;
+                    text-align: center;
+                }
                 .localimage-root .localimage-media-container { 
-                    width: 100%; background-color: #111; 
-                    overflow: hidden; display: flex; align-items: center; 
-                    justify-content: center; flex-shrink: 0;
-                    position: relative;
+                    width: 100%; background-color: #111; overflow: hidden;
+                    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
                 }
-                .localimage-root .localimage-media-container img { 
-                    width: 100%; height: 100%; object-fit: cover;
-                }
+                .localimage-root .localimage-media-container img { width: 100%; height: 100%; object-fit: cover; }
                 .localimage-root .localimage-image-card-info { 
                     padding: 4px 6px; background: #2a2a2a; flex-grow: 1;
                     display: flex; align-items: center; justify-content: center;
